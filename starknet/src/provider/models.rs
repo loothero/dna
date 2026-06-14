@@ -26,6 +26,15 @@ pub trait BlockExt {
     fn cursor(&self) -> Option<Cursor>;
 }
 
+pub fn felt_to_hash(value: &FieldElement) -> Hash {
+    let bytes = value.to_bytes_be();
+    let bytes = bytes.as_ref();
+    let mut out = vec![0; 32];
+    let len = bytes.len().min(32);
+    out[32 - len..].copy_from_slice(&bytes[bytes.len() - len..]);
+    Hash(out)
+}
+
 impl BlockExt for MaybePreConfirmedBlockWithTxHashes {
     fn is_finalized(&self) -> bool {
         let MaybePreConfirmedBlockWithTxHashes::Block(block) = self else {
@@ -41,8 +50,8 @@ impl BlockExt for MaybePreConfirmedBlockWithTxHashes {
         };
 
         let number = block.block_number;
-        let hash = block.block_hash.to_bytes_be().to_vec();
+        let hash = felt_to_hash(&block.block_hash);
 
-        Cursor::new(number, Hash(hash)).into()
+        Cursor::new(number, hash).into()
     }
 }

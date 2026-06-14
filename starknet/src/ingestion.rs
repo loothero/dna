@@ -11,7 +11,7 @@ use apibara_dna_common::{
         BlockIngestion, BoxedNewHeadsStream, BoxedPendingBlockUpdateStream, IngestionError,
     },
     join::{JoinToManyIndexBuilder, JoinToOneIndexBuilder},
-    Cursor, Hash,
+    Cursor,
 };
 use apibara_dna_protocol::starknet;
 use error_stack::{Report, Result, ResultExt};
@@ -110,6 +110,10 @@ pub(crate) struct BlockIngestionResult {
 impl BlockIngestion for StarknetBlockIngestion {
     fn supports_pending(&self) -> bool {
         self.options.ingest_pending
+    }
+
+    fn supports_pending_ahead(&self) -> bool {
+        self.options.ingest_pending && self.options.live_ingestion_enabled
     }
 
     #[tracing::instrument("starknet_new_heads_stream", skip_all, err(Debug))]
@@ -257,14 +261,14 @@ impl BlockIngestion for StarknetBlockIngestion {
                 .attach_printable_lazy(|| format!("block number: {}", block_number));
         };
 
-        let hash = block.block_hash.to_bytes_be().to_vec();
-        let parent = block.parent_hash.to_bytes_be().to_vec();
+        let hash = models::felt_to_hash(&block.block_hash);
+        let parent = models::felt_to_hash(&block.parent_hash);
         let number = block.block_number;
 
         Ok(BlockInfo {
             number,
-            hash: Hash(hash),
-            parent: Hash(parent),
+            hash,
+            parent,
         })
     }
 
@@ -289,6 +293,8 @@ impl BlockIngestion for StarknetBlockIngestion {
 
                 return Ok(Some((block_info, live_block.block)));
             }
+
+            return Ok(None);
         }
 
         let block_id = BlockId::Pending;
@@ -474,14 +480,14 @@ impl BlockIngestion for StarknetBlockIngestion {
             .await
             .change_context(IngestionError::RpcRequest)??;
 
-        let hash = block.block_hash.to_bytes_be().to_vec();
-        let parent = block.parent_hash.to_bytes_be().to_vec();
+        let hash = models::felt_to_hash(&block.block_hash);
+        let parent = models::felt_to_hash(&block.parent_hash);
         let number = block.block_number;
 
         let block_info = BlockInfo {
             number,
-            hash: Hash(hash),
-            parent: Hash(parent),
+            hash,
+            parent,
         };
         let block = tracing::info_span!("index_block").in_scope(|| {
             let header_fragment = {

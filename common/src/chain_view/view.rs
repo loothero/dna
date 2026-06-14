@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
 
 use error_stack::Result;
 use tokio::sync::{Notify, RwLock};
@@ -20,6 +20,7 @@ pub struct ChainView(Arc<RwLock<ChainViewInner>>);
 pub(crate) struct ChainViewInner {
     finalized: u64,
     pending_block: Option<PendingBlockRef>,
+    pending_blocks: VecDeque<PendingBlockRef>,
     segmented: Option<u64>,
     grouped: Option<u64>,
     canonical: FullCanonicalChain,
@@ -45,6 +46,7 @@ impl ChainView {
             finalized,
             segmented,
             pending_block: None,
+            pending_blocks: VecDeque::new(),
             grouped,
             canonical,
             segment_size,
@@ -209,6 +211,11 @@ impl ChainView {
         inner.pending_block
     }
 
+    pub async fn get_pending_blocks(&self) -> Vec<PendingBlockRef> {
+        let inner = self.0.read().await;
+        inner.pending_blocks.iter().copied().collect()
+    }
+
     pub(crate) async fn set_finalized_block(&self, block: u64) {
         let mut inner = self.0.write().await;
         inner.metrics.finalized.record(block, &[]);
@@ -223,6 +230,17 @@ impl ChainView {
         }
 
         inner.pending_block = pending_block;
+        match pending_block {
+            Some(pending_block) => {
+                if inner.pending_blocks.back() != Some(&pending_block) {
+                    inner.pending_blocks.push_back(pending_block);
+                }
+                while inner.pending_blocks.len() > 256 {
+                    inner.pending_blocks.pop_front();
+                }
+            }
+            None => inner.pending_blocks.clear(),
+        }
         inner.pending_notify.notify_waiters();
     }
 

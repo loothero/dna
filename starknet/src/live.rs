@@ -236,6 +236,15 @@ impl StarknetLiveAssembler {
         &mut self,
         after_block_number: u64,
     ) -> Result<Option<LivePendingBlock>, IngestionError> {
+        if let Some(index) = self.pending_updates.iter().position(|update| {
+            update.mode == LivePendingUpdateMode::Events && update.block_number > after_block_number
+        }) {
+            let update = self.pending_updates.remove(index).unwrap();
+            if let Some(block) = self.build_event_pending_block(update.block_number)? {
+                return Ok(Some(block));
+            }
+        }
+
         while let Some(update) = self.pending_updates.pop_front() {
             if update.block_number <= after_block_number {
                 continue;
@@ -648,6 +657,28 @@ mod tests {
 
         let pending = assembler.build_next_pending_block(9).unwrap().unwrap();
         assert_eq!(pending.block_number, 10);
+        assert_eq!(
+            body_fragment(&pending.block, EVENT_FRAGMENT_ID).data.len(),
+            1
+        );
+        assert!(!pending
+            .block
+            .body
+            .iter()
+            .any(|fragment| fragment.fragment_id == RECEIPT_FRAGMENT_ID));
+    }
+
+    #[test]
+    fn prioritizes_event_updates_over_receipt_backlog() {
+        let mut assembler = StarknetLiveAssembler::new();
+
+        for hash in 1..=100 {
+            assembler.push_receipt_with_meta(receipt(hash, 10), Some(hash));
+        }
+        assembler.push_event_with_meta(emitted_event(101, 11, 0, 0));
+
+        let pending = assembler.build_next_pending_block(9).unwrap().unwrap();
+        assert_eq!(pending.block_number, 11);
         assert_eq!(
             body_fragment(&pending.block, EVENT_FRAGMENT_ID).data.len(),
             1

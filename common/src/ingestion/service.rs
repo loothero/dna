@@ -47,6 +47,10 @@ pub trait BlockIngestion: Clone {
         false
     }
 
+    fn supports_pending_ahead(&self) -> bool {
+        false
+    }
+
     fn get_head_cursor(&self) -> impl Future<Output = Result<Cursor, IngestionError>> + Send;
 
     fn get_finalized_cursor(&self) -> impl Future<Output = Result<Cursor, IngestionError>> + Send;
@@ -142,10 +146,18 @@ pub enum IngestionState {
     Recover(RecoverState),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingBlockTaskSource {
+    Poll,
+    Push,
+}
+
 #[derive(Debug, Default)]
 struct PendingBlockState {
     queued: bool,
     generation: u64,
+    source: Option<PendingBlockTaskSource>,
+    reschedule: bool,
 }
 
 pub struct IngestState {
@@ -184,11 +196,25 @@ impl fmt::Debug for IngestState {
     }
 }
 
-#[derive(Debug)]
 pub struct RecoverState {
     pub finalized: Cursor,
     pub existing_head: Cursor,
     pub last_ingested: Cursor,
+    pending_block_updates_stream: Option<BoxedPendingBlockUpdateStream>,
+}
+
+impl fmt::Debug for RecoverState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecoverState")
+            .field("finalized", &self.finalized)
+            .field("existing_head", &self.existing_head)
+            .field("last_ingested", &self.last_ingested)
+            .field(
+                "pending_block_updates_stream",
+                &self.pending_block_updates_stream.is_some(),
+            )
+            .finish()
+    }
 }
 
 /// What action to take when starting ingestion.
@@ -311,6 +337,7 @@ where
                     finalized,
                     existing_head: head,
                     last_ingested,
+                    pending_block_updates_stream: None,
                 }))
             }
             IngestionStartAction::Start(starting_block) => {
@@ -447,7 +474,7 @@ where
                         // scheduled a pending block refresh.
                         state.pending_refresh_interval.reset();
 
-                        self.tick_refresh_pending(state).await
+                        self.tick_refresh_pending(state, PendingBlockTaskSource::Push).await
                     }
                     Some(Err(err)) => {
                         warn!(error = ?err, "pending block update stream error, reconnecting");
@@ -468,10 +495,11 @@ where
                 self.tick_refresh_finalized(state).await
             }
 
-            _ = state.pending_refresh_interval.tick(), if state.head == state.last_ingested && self.ingestion.supports_pending() => {
+            _ = state.pending_refresh_interval.tick(), if self.ingestion.supports_pending()
+                && (state.head == state.last_ingested || self.ingestion.supports_pending_ahead()) => {
                 current_span.record("action", "refresh_pending");
 
-                self.tick_refresh_pending(state).await
+                self.tick_refresh_pending(state, PendingBlockTaskSource::Poll).await
             }
 
             _ = state.head_refresh_interval.tick() => {
@@ -542,19 +570,11 @@ where
         if state.last_ingested.number >= head.number {
             if state.head.number > head.number {
                 info!(old_head = %state.head, new_head = %head, "reorg detected");
-                return Ok(IngestionState::Recover(RecoverState {
-                    finalized: state.finalized,
-                    existing_head: state.head,
-                    last_ingested: state.last_ingested,
-                }));
+                return Ok(recover_from_ingest_state(state));
             }
 
             if state.head.number == head.number && state.head.hash != head.hash {
-                return Ok(IngestionState::Recover(RecoverState {
-                    finalized: state.finalized,
-                    existing_head: state.head,
-                    last_ingested: state.last_ingested,
-                }));
+                return Ok(recover_from_ingest_state(state));
             }
         }
 
@@ -578,16 +598,26 @@ where
         }))
     }
 
-    pub async fn tick_refresh_pending(
+    async fn tick_refresh_pending(
         &mut self,
         mut state: IngestState,
+        source: PendingBlockTaskSource,
     ) -> Result<IngestionState, IngestionError> {
         if state.pending_block_state.queued {
-            return Ok(IngestionState::Ingest(state));
+            if !prepare_queued_pending_task_for_refresh(
+                &mut state.pending_task,
+                &mut state.pending_block_state,
+                source,
+                self.ingestion.supports_pending_ahead(),
+            ) {
+                return Ok(IngestionState::Ingest(state));
+            }
         }
 
-        // Only ingest pending blocks if they will be used.
-        if state.head != state.last_ingested {
+        // The canonical HTTP path can only publish the next block after the current head.
+        // Push-based live paths may know the pending block number and publish optimistic
+        // data ahead of canonical catch-up.
+        if state.head != state.last_ingested && !self.ingestion.supports_pending_ahead() {
             return Ok(IngestionState::Ingest(state));
         }
 
@@ -597,6 +627,8 @@ where
         ));
 
         state.pending_block_state.queued = true;
+        state.pending_block_state.source = Some(source);
+        state.pending_block_state.reschedule = false;
 
         Ok(IngestionState::Ingest(state))
     }
@@ -607,17 +639,22 @@ where
         join_result: Option<IngestionJobJoinResult>,
     ) -> Result<IngestionState, IngestionError> {
         state.pending_task = None;
+        let reschedule = state.pending_block_state.reschedule;
 
         let Some(join_result) = join_result else {
             let new_pending_block_state = PendingBlockState {
                 queued: false,
                 generation: state.pending_block_state.generation,
+                source: None,
+                reschedule: false,
             };
 
-            return Ok(IngestionState::Ingest(IngestState {
+            let state = IngestState {
                 pending_block_state: new_pending_block_state,
                 ..state
-            }));
+            };
+
+            return self.reschedule_pending_if_needed(state, reschedule).await;
         };
 
         let task_result = join_result
@@ -633,12 +670,16 @@ where
                 let new_pending_block_state = PendingBlockState {
                     queued: false,
                     generation: state.pending_block_state.generation,
+                    source: None,
+                    reschedule: false,
                 };
 
-                Ok(IngestionState::Ingest(IngestState {
+                let state = IngestState {
                     pending_block_state: new_pending_block_state,
                     ..state
-                }))
+                };
+
+                self.reschedule_pending_if_needed(state, reschedule).await
             }
             IngestionTask::Pending(Some(block_info)) => {
                 info!(
@@ -659,12 +700,16 @@ where
                 let new_pending_block_state = PendingBlockState {
                     queued: false,
                     generation: block_info.generation,
+                    source: None,
+                    reschedule: false,
                 };
 
-                Ok(IngestionState::Ingest(IngestState {
+                let state = IngestState {
                     pending_block_state: new_pending_block_state,
                     ..state
-                }))
+                };
+
+                self.reschedule_pending_if_needed(state, reschedule).await
             }
             IngestionTask::Main(_) => Err(IngestionError::Model)
                 .attach_printable("expected pending ingestion task, got main ingestion task"),
@@ -686,11 +731,7 @@ where
             let block_info = match task_result {
                 Ok(block_info) => block_info,
                 Err(err) if err.is_block_not_found() => {
-                    return Ok(IngestionState::Recover(RecoverState {
-                        finalized: state.finalized,
-                        existing_head: state.head,
-                        last_ingested: state.last_ingested,
-                    }));
+                    return Ok(recover_from_ingest_state(state));
                 }
                 Err(err) => {
                     return Err(err)
@@ -705,6 +746,8 @@ where
                     let new_pending_block_state = PendingBlockState {
                         queued: false,
                         generation: state.pending_block_state.generation,
+                        source: None,
+                        reschedule: false,
                     };
 
                     return Ok(IngestionState::Ingest(IngestState {
@@ -731,6 +774,8 @@ where
                     let new_pending_block_state = PendingBlockState {
                         queued: false,
                         generation: block_info.generation,
+                        source: None,
+                        reschedule: false,
                     };
 
                     return Ok(IngestionState::Ingest(IngestState {
@@ -746,11 +791,7 @@ where
             let mut should_upload_recent_segment = block_info.number >= state.finalized.number;
 
             if !self.chain_builder.can_grow(&block_info) {
-                return Ok(IngestionState::Recover(RecoverState {
-                    finalized: state.finalized,
-                    existing_head: state.head,
-                    last_ingested: state.last_ingested,
-                }));
+                return Ok(recover_from_ingest_state(state));
             }
 
             last_ingested = block_info.cursor();
@@ -895,7 +936,10 @@ where
         info!(new_head = %new_head_candidate, "recovered from a chain reorganization");
 
         let new_heads_stream = self.ingestion.new_heads_stream().await;
-        let pending_block_updates_stream = self.ingestion.pending_block_updates_stream().await;
+        let pending_block_updates_stream = match state.pending_block_updates_stream {
+            Some(stream) => stream,
+            None => self.ingestion.pending_block_updates_stream().await,
+        };
 
         Ok(IngestionState::Ingest(IngestState {
             finalized: state.finalized,
@@ -974,6 +1018,19 @@ where
         })
     }
 
+    async fn reschedule_pending_if_needed(
+        &mut self,
+        state: IngestState,
+        reschedule: bool,
+    ) -> Result<IngestionState, IngestionError> {
+        if reschedule && self.ingestion.supports_pending_ahead() {
+            self.tick_refresh_pending(state, PendingBlockTaskSource::Push)
+                .await
+        } else {
+            Ok(IngestionState::Ingest(state))
+        }
+    }
+
     pub fn current_chain_segment(&self) -> Option<CanonicalChainSegment> {
         self.chain_builder.current_segment().ok()
     }
@@ -1033,12 +1090,50 @@ async fn pending_task_next(
     Some(task.as_mut()?.await)
 }
 
+fn prepare_queued_pending_task_for_refresh(
+    pending_task: &mut Option<IngestionTaskHandle>,
+    pending_block_state: &mut PendingBlockState,
+    source: PendingBlockTaskSource,
+    supports_pending_ahead: bool,
+) -> bool {
+    if !supports_pending_ahead || source != PendingBlockTaskSource::Push {
+        return false;
+    }
+
+    if pending_block_state.source == Some(PendingBlockTaskSource::Poll) {
+        if let Some(task) = pending_task.take() {
+            task.abort();
+        }
+
+        pending_block_state.queued = false;
+        pending_block_state.source = None;
+        pending_block_state.reschedule = false;
+        return true;
+    }
+
+    pending_block_state.reschedule = true;
+    false
+}
+
+fn recover_from_ingest_state(state: IngestState) -> IngestionState {
+    IngestionState::Recover(RecoverState {
+        finalized: state.finalized,
+        existing_head: state.head,
+        last_ingested: state.last_ingested,
+        pending_block_updates_stream: Some(state.pending_block_updates_stream),
+    })
+}
+
 impl<I> IngestionInner<I>
 where
     I: BlockIngestion + Send + Sync + 'static,
 {
     fn supports_pending(&self) -> bool {
         self.ingestion.supports_pending()
+    }
+
+    fn supports_pending_ahead(&self) -> bool {
+        self.ingestion.supports_pending_ahead()
     }
 
     async fn new_heads_stream(&self) -> BoxedNewHeadsStream {
@@ -1251,5 +1346,68 @@ impl IngestionState {
                 metrics.finalized.record(state.finalized.number, &[]);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending_task_handle() -> IngestionTaskHandle {
+        tokio::spawn(async { futures::future::pending().await })
+    }
+
+    #[tokio::test]
+    async fn push_update_preempts_poll_pending_task_when_pending_ahead_supported() {
+        let mut pending_task = Some(pending_task_handle());
+        let mut pending_block_state = PendingBlockState {
+            queued: true,
+            generation: 7,
+            source: Some(PendingBlockTaskSource::Poll),
+            reschedule: false,
+        };
+
+        let preempted = prepare_queued_pending_task_for_refresh(
+            &mut pending_task,
+            &mut pending_block_state,
+            PendingBlockTaskSource::Push,
+            true,
+        );
+
+        assert!(preempted);
+        assert!(pending_task.is_none());
+        assert!(!pending_block_state.queued);
+        assert_eq!(pending_block_state.source, None);
+        assert_eq!(pending_block_state.generation, 7);
+        assert!(!pending_block_state.reschedule);
+    }
+
+    #[tokio::test]
+    async fn push_update_marks_push_pending_task_for_reschedule() {
+        let mut pending_task = Some(pending_task_handle());
+        let mut pending_block_state = PendingBlockState {
+            queued: true,
+            generation: 7,
+            source: Some(PendingBlockTaskSource::Push),
+            reschedule: false,
+        };
+
+        let preempted = prepare_queued_pending_task_for_refresh(
+            &mut pending_task,
+            &mut pending_block_state,
+            PendingBlockTaskSource::Push,
+            true,
+        );
+
+        assert!(!preempted);
+        assert!(pending_task.is_some());
+        assert!(pending_block_state.queued);
+        assert_eq!(
+            pending_block_state.source,
+            Some(PendingBlockTaskSource::Push)
+        );
+        assert!(pending_block_state.reschedule);
+
+        pending_task.take().unwrap().abort();
     }
 }

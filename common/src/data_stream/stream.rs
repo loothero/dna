@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use apibara_dna_protocol::dna::stream::{
     stream_data_response::Message, Data, DataFinality, DataProduction, Finalize, Invalidate,
@@ -382,11 +382,22 @@ impl DataStream {
         tx: &mpsc::Sender<DataStreamMessage>,
         ct: &CancellationToken,
     ) -> Result<(), DataStreamError> {
-        let mut pending_block = self.chain_view.get_pending_block().await;
+        let mut pending_blocks = self.chain_view.get_pending_blocks().await;
+        let mut sent_pending_blocks = BTreeSet::new();
         let mut content_hash = Vec::new();
         loop {
-            if let Some(pending_block) = pending_block.take() {
-                if let Some(head) = &self.current {
+            if let Some(head) = &self.current {
+                for pending_block in pending_blocks.drain(..) {
+                    if pending_block
+                        .number
+                        .is_some_and(|number| number <= head.number)
+                    {
+                        continue;
+                    }
+                    if !sent_pending_blocks.insert((pending_block.number, pending_block.generation))
+                    {
+                        continue;
+                    }
                     self.send_pending_block(head, pending_block, &mut content_hash, tx, ct)
                         .await?;
                 }
@@ -407,7 +418,7 @@ impl DataStream {
                 },
                 _ = self.chain_view.pending_changed() => {
                     debug!("pending changed (pending)");
-                    pending_block = self.chain_view.get_pending_block().await;
+                    pending_blocks = self.chain_view.get_pending_blocks().await;
                 }
             }
         }
@@ -565,29 +576,12 @@ impl DataStream {
                 };
                 let join = &join_fragment.joins[target_pos];
 
-                let target_fragment_matches =
-                    fragment_matches.entry(target_fragment_id).or_default();
-
-                match &join.index {
-                    ArchivedJoinTo::One(inner) => {
-                        for match_ in filter_match.iter() {
-                            if let Some(index) = inner.get(&match_.index) {
-                                for filter_id in match_.filter_ids.iter() {
-                                    target_fragment_matches.add_single_match(*filter_id, index);
-                                }
-                            }
-                        }
-                    }
-                    ArchivedJoinTo::Many(inner) => {
-                        for match_ in filter_match.iter() {
-                            if let Some(bitmap) = inner.get(&match_.index) {
-                                for filter_id in match_.filter_ids.iter() {
-                                    target_fragment_matches.add_match(*filter_id, &bitmap);
-                                }
-                            }
-                        }
-                    }
-                }
+                add_join_target_matches(
+                    &mut fragment_matches,
+                    target_fragment_id,
+                    &filter_match,
+                    &join.index,
+                );
             }
 
             let should_send_header = match block_filter.header_filter {
@@ -686,6 +680,38 @@ impl DataStream {
     }
 }
 
+fn add_join_target_matches(
+    fragment_matches: &mut BTreeMap<FragmentId, FilterMatch>,
+    target_fragment_id: FragmentId,
+    filter_match: &FilterMatch,
+    join_index: &ArchivedJoinTo,
+) {
+    match join_index {
+        ArchivedJoinTo::One(inner) => {
+            for match_ in filter_match.iter() {
+                if let Some(index) = inner.get(&match_.index) {
+                    let target_fragment_matches =
+                        fragment_matches.entry(target_fragment_id).or_default();
+                    for filter_id in match_.filter_ids.iter() {
+                        target_fragment_matches.add_single_match(*filter_id, index);
+                    }
+                }
+            }
+        }
+        ArchivedJoinTo::Many(inner) => {
+            for match_ in filter_match.iter() {
+                if let Some(bitmap) = inner.get(&match_.index) {
+                    let target_fragment_matches =
+                        fragment_matches.entry(target_fragment_id).or_default();
+                    for filter_id in match_.filter_ids.iter() {
+                        target_fragment_matches.add_match(*filter_id, &bitmap);
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl error_stack::Context for DataStreamError {}
 
 impl std::fmt::Display for DataStreamError {
@@ -697,5 +723,52 @@ impl std::fmt::Display for DataStreamError {
 impl Drop for DataStream {
     fn drop(&mut self) {
         self.metrics.active.add(-1, &[]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::join::{JoinTo, JoinToOneIndexBuilder};
+
+    #[test]
+    fn join_expansion_skips_empty_target_matches() {
+        let join = JoinTo::One(JoinToOneIndexBuilder::default().build());
+        let join_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&join).unwrap();
+        let join_index = unsafe { rkyv::access_unchecked::<ArchivedJoinTo>(&join_bytes) };
+
+        let mut filter_match = FilterMatch::default();
+        filter_match.add_single_match(42, 0);
+
+        let mut fragment_matches = BTreeMap::new();
+        add_join_target_matches(&mut fragment_matches, 3, &filter_match, join_index);
+
+        assert!(!fragment_matches.contains_key(&3));
+    }
+
+    #[test]
+    fn join_expansion_keeps_populated_target_matches() {
+        let mut builder = JoinToOneIndexBuilder::default();
+        builder.insert(0, 7);
+
+        let join = JoinTo::One(builder.build());
+        let join_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&join).unwrap();
+        let join_index = unsafe { rkyv::access_unchecked::<ArchivedJoinTo>(&join_bytes) };
+
+        let mut filter_match = FilterMatch::default();
+        filter_match.add_single_match(42, 0);
+
+        let mut fragment_matches = BTreeMap::new();
+        add_join_target_matches(&mut fragment_matches, 3, &filter_match, join_index);
+
+        let matches = fragment_matches
+            .get(&3)
+            .expect("target fragment should have matches")
+            .iter()
+            .collect::<Vec<_>>();
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].index, 7);
+        assert_eq!(matches[0].filter_ids, vec![42]);
     }
 }

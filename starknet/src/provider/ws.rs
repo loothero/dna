@@ -65,8 +65,11 @@ pub enum StarknetLiveMessage {
 
 /// A stream subscribed to Starknet pre-confirmed transaction bodies and receipts.
 pub struct StarknetLiveTransactionsStream {
-    inner: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    inner: BoxedStarknetLiveMessageStream,
 }
+
+type BoxedStarknetLiveMessageStream =
+    Pin<Box<dyn Stream<Item = Result<StarknetLiveMessage, StarknetProviderError>> + Send>>;
 
 #[derive(Debug, Clone, Default)]
 pub struct StarknetLiveEventFilter {
@@ -120,57 +123,16 @@ impl StarknetLiveTransactionsStream {
         url: &str,
         event_filter: Option<StarknetLiveEventFilter>,
     ) -> Result<Self, StarknetProviderError> {
-        let (ws_stream, _) = tokio_tungstenite::connect_async(url)
-            .await
-            .change_context(StarknetProviderError::Request)
-            .attach_printable("failed to connect to ws stream")?;
+        let mut groups = live_subscribe_request_groups(event_filter);
+        let first_group = groups.remove(0);
+        let mut stream = connect_live_message_stream(url, first_group).await?;
 
-        let (mut write, read) = ws_stream.split();
-
-        if let Some(event_filter) = event_filter {
-            write
-                .send(
-                    LiveSubscribeRequest::Events(StarknetSubscribeEventsRequest {
-                        from_address: event_filter.from_address.map(AddressFilter::Single),
-                        keys: event_filter.keys,
-                        block_id: None,
-                        finality_status: Some(L2TransactionFinalityStatus::PreConfirmed),
-                    })
-                    .into(),
-                )
-                .await
-                .change_context(StarknetProviderError::Request)
-                .attach_printable("failed to send event subscribe request")?;
+        for group in groups {
+            let next = connect_live_message_stream(url, group).await?;
+            stream = futures::stream::select(stream, next).boxed();
         }
 
-        write
-            .send(
-                LiveSubscribeRequest::NewTransactionReceipts(
-                    StarknetSubscribeNewTransactionReceiptsRequest {
-                        finality_status: Some(vec![L2TransactionFinalityStatus::PreConfirmed]),
-                        sender_address: None,
-                    },
-                )
-                .into(),
-            )
-            .await
-            .change_context(StarknetProviderError::Request)
-            .attach_printable("failed to send transaction receipt subscribe request")?;
-
-        write
-            .send(
-                LiveSubscribeRequest::NewTransactions(StarknetSubscribeNewTransactionsRequest {
-                    finality_status: Some(vec![L2TransactionStatus::PreConfirmed]),
-                    sender_address: None,
-                    tags: None,
-                })
-                .into(),
-            )
-            .await
-            .change_context(StarknetProviderError::Request)
-            .attach_printable("failed to send transaction subscribe request")?;
-
-        Ok(Self { inner: read })
+        Ok(Self { inner: stream })
     }
 }
 
@@ -211,13 +173,13 @@ impl NewHeadMessage {
         let block_number = params.result.block_number;
         let block_hash_hex = params.result.block_hash;
 
-        let block_hash = decode_hex_felt(&block_hash_hex)
+        let block_hash = decode_hex_hash(&block_hash_hex)
             .change_context(StarknetProviderError::Request)
             .attach_printable_lazy(|| format!("failed to decode block_hash: {}", block_hash_hex))?;
 
         Ok(Some(NewHeadMessage {
             block_number,
-            block_hash: Hash(block_hash),
+            block_hash,
         }))
     }
 }
@@ -302,6 +264,14 @@ fn decode_hex_felt(hex: &str) -> std::result::Result<Vec<u8>, hex::FromHexError>
     hex::decode(&hex)
 }
 
+fn decode_hex_hash(hex: &str) -> std::result::Result<Hash, hex::FromHexError> {
+    let bytes = decode_hex_felt(hex)?;
+    let mut out = vec![0; 32];
+    let len = bytes.len().min(32);
+    out[32 - len..].copy_from_slice(&bytes[bytes.len() - len..]);
+    Ok(Hash(out))
+}
+
 fn extract_result_u64(params: &serde_json::Value, field: &str) -> Option<u64> {
     let result = match params {
         serde_json::Value::Object(object) => object.get("result"),
@@ -323,6 +293,82 @@ fn json_value_as_u64(value: &serde_json::Value) -> Option<u64> {
     } else {
         value.parse().ok()
     }
+}
+
+fn live_subscribe_request_groups(
+    event_filter: Option<StarknetLiveEventFilter>,
+) -> Vec<Vec<LiveSubscribeRequest>> {
+    let mut groups = Vec::new();
+
+    if let Some(event_filter) = event_filter {
+        groups.push(vec![LiveSubscribeRequest::Events(
+            StarknetSubscribeEventsRequest {
+                from_address: event_filter.from_address.map(AddressFilter::Single),
+                keys: event_filter.keys,
+                block_id: None,
+                finality_status: Some(L2TransactionFinalityStatus::PreConfirmed),
+            },
+        )]);
+    }
+
+    groups.push(vec![
+        LiveSubscribeRequest::NewTransactionReceipts(
+            StarknetSubscribeNewTransactionReceiptsRequest {
+                finality_status: Some(vec![L2TransactionFinalityStatus::PreConfirmed]),
+                sender_address: None,
+            },
+        ),
+        LiveSubscribeRequest::NewTransactions(StarknetSubscribeNewTransactionsRequest {
+            finality_status: Some(vec![L2TransactionStatus::PreConfirmed]),
+            sender_address: None,
+            tags: None,
+        }),
+    ]);
+
+    groups
+}
+
+async fn connect_live_message_stream(
+    url: &str,
+    requests: Vec<LiveSubscribeRequest>,
+) -> Result<BoxedStarknetLiveMessageStream, StarknetProviderError> {
+    let (ws_stream, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .change_context(StarknetProviderError::Request)
+        .attach_printable("failed to connect to ws stream")?;
+
+    let (mut write, read) = ws_stream.split();
+
+    for request in requests {
+        write
+            .send(request.into())
+            .await
+            .change_context(StarknetProviderError::Request)
+            .attach_printable("failed to send live subscribe request")?;
+    }
+
+    Ok(decode_live_message_stream(read))
+}
+
+fn decode_live_message_stream(
+    read: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+) -> BoxedStarknetLiveMessageStream {
+    read.filter_map(|message| async move {
+        match message {
+            Ok(message) => match StarknetLiveMessage::try_from_message(message) {
+                Ok(Some(message)) => Some(Ok(message)),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            },
+            Err(error) => {
+                let error = Err::<(), _>(error)
+                    .change_context(StarknetProviderError::Request)
+                    .unwrap_err();
+                Some(Err(error))
+            }
+        }
+    })
+    .boxed()
 }
 
 impl Stream for NewHeadsStream {
@@ -348,23 +394,7 @@ impl Stream for StarknetLiveTransactionsStream {
     type Item = Result<StarknetLiveMessage, StarknetProviderError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        loop {
-            match self.inner.poll_next_unpin(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Ready(Some(Ok(msg))) => match StarknetLiveMessage::try_from_message(msg) {
-                    Ok(None) => continue,
-                    Ok(Some(msg)) => return Poll::Ready(Some(Ok(msg))),
-                    Err(e) => return Poll::Ready(Some(Err(e))),
-                },
-                Poll::Ready(Some(Err(e))) => {
-                    let err = Err::<(), _>(e)
-                        .change_context(StarknetProviderError::Request)
-                        .unwrap_err();
-                    return Poll::Ready(Some(Err(err)));
-                }
-            }
-        }
+        self.inner.poll_next_unpin(cx)
     }
 }
 
@@ -554,6 +584,42 @@ mod tests {
     }
 
     #[test]
+    fn live_subscribe_request_groups_use_dedicated_event_connection() {
+        let mut groups = live_subscribe_request_groups(Some(StarknetLiveEventFilter {
+            from_address: Some(Felt::from_hex("0x1").unwrap()),
+            keys: Some(vec![vec![Felt::from_hex("0x2").unwrap()]]),
+        }));
+
+        assert_eq!(groups.len(), 2);
+
+        let event_group = groups.remove(0);
+        assert_eq!(event_group.len(), 1);
+        let event_request: serde_json::Value =
+            serde_json::from_str(&event_group.into_iter().next().unwrap().into_string()).unwrap();
+        assert_eq!(event_request["method"], "starknet_subscribeEvents");
+        assert_eq!(event_request["params"]["from_address"], json!("0x1"));
+        assert_eq!(event_request["params"]["keys"], json!([["0x2"]]));
+
+        let transaction_group = groups.remove(0);
+        assert_eq!(transaction_group.len(), 2);
+        let methods = transaction_group
+            .into_iter()
+            .map(|request| {
+                let request: serde_json::Value =
+                    serde_json::from_str(&request.into_string()).unwrap();
+                request["method"].as_str().unwrap().to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            vec![
+                "starknet_subscribeNewTransactionReceipts",
+                "starknet_subscribeNewTransactions"
+            ]
+        );
+    }
+
+    #[test]
     fn parses_transaction_receipt_notification() {
         let message = json!({
             "jsonrpc": "2.0",
@@ -592,6 +658,32 @@ mod tests {
                 unit: PriceUnit::Fri
             }
         );
+    }
+
+    #[test]
+    fn parses_new_head_hash_as_fixed_width_cursor_hash() {
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": "starknet_subscriptionNewHeads",
+            "params": {
+                "subscription_id": "0x4",
+                "result": {
+                    "block_number": 10,
+                    "block_hash": "0x123"
+                }
+            }
+        });
+
+        let parsed = NewHeadMessage::try_from_message(Message::Text(message.to_string().into()))
+            .unwrap()
+            .expect("head notification");
+
+        let mut expected = vec![0; 32];
+        expected[30] = 0x01;
+        expected[31] = 0x23;
+
+        assert_eq!(parsed.block_number, 10);
+        assert_eq!(parsed.block_hash, Hash(expected));
     }
 
     #[test]
