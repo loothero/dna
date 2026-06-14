@@ -39,8 +39,8 @@ use crate::{
     live::{LiveAssemblerInsert, StarknetLiveAssembler},
     proto::{convert_block_header, convert_pre_confirmed_block_header, ModelExt},
     provider::{
-        models, BlockExt, BlockId, StarknetLiveTransactionsStream, StarknetProvider,
-        StarknetProviderError, StarknetProviderErrorExt,
+        models, BlockExt, BlockId, StarknetLiveEventFilter, StarknetLiveTransactionsStream,
+        StarknetProvider, StarknetProviderError, StarknetProviderErrorExt,
     },
     NewHeadsStream,
 };
@@ -50,6 +50,8 @@ pub struct StarknetBlockIngestionOptions {
     pub ingest_pending: bool,
     pub ingest_traces: bool,
     pub live_ingestion_enabled: bool,
+    pub live_event_address: Option<String>,
+    pub live_event_key0: Option<String>,
 }
 
 pub struct StarknetBlockIngestion {
@@ -71,6 +73,31 @@ impl StarknetBlockIngestion {
             options,
             live_assembler: Arc::new(Mutex::new(StarknetLiveAssembler::new())),
         }
+    }
+
+    fn live_event_filter(&self) -> Result<Option<StarknetLiveEventFilter>, IngestionError> {
+        let from_address = self
+            .options
+            .live_event_address
+            .as_deref()
+            .map(|value| parse_live_filter_felt(value, "STARKNET_WS_LIVE_EVENT_ADDRESS"))
+            .transpose()?;
+
+        let key0 = self
+            .options
+            .live_event_key0
+            .as_deref()
+            .map(|value| parse_live_filter_felt(value, "STARKNET_WS_LIVE_EVENT_KEY0"))
+            .transpose()?;
+
+        if from_address.is_none() && key0.is_none() {
+            return Ok(None);
+        }
+
+        Ok(Some(StarknetLiveEventFilter {
+            from_address,
+            keys: key0.map(|key| vec![vec![key]]),
+        }))
     }
 }
 
@@ -127,10 +154,14 @@ impl BlockIngestion for StarknetBlockIngestion {
             return Ok(futures::stream::pending().boxed());
         };
 
-        info!("subscribing to live starknet transaction receipts");
+        let event_filter = self.live_event_filter()?;
+        info!(
+            event_filter_enabled = event_filter.is_some(),
+            "subscribing to live starknet transaction receipts"
+        );
 
         let assembler = self.live_assembler.clone();
-        let stream = StarknetLiveTransactionsStream::connect(url)
+        let stream = StarknetLiveTransactionsStream::connect(url, event_filter)
             .await
             .change_context(IngestionError::RpcRequest)
             .attach_printable("failed to connect to starknet live ws")?
@@ -496,6 +527,17 @@ impl BlockIngestion for StarknetBlockIngestion {
 
         Ok((block_info, block))
     }
+}
+
+fn parse_live_filter_felt(
+    value: &str,
+    name: &'static str,
+) -> Result<models::FieldElement, IngestionError> {
+    models::FieldElement::from_hex(value).map_err(|err| {
+        Report::new(IngestionError::Options)
+            .attach_printable(format!("invalid {name}: {value}"))
+            .attach_printable(err)
+    })
 }
 
 impl Clone for StarknetBlockIngestion {

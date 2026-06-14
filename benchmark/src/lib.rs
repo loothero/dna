@@ -85,6 +85,9 @@ pub struct StarknetLiveLatencyArgs {
     /// Optional keyed-layout adventurer id. If omitted, all GameEvent events are matched.
     #[clap(long)]
     pub adventurer_id: Option<String>,
+    /// DNA starting block. Use a recent head block for live-only latency runs.
+    #[clap(long)]
+    pub starting_block: Option<u64>,
     /// Benchmark duration in seconds.
     #[clap(long, default_value = "120")]
     pub duration_secs: u64,
@@ -281,15 +284,19 @@ async fn run_starknet_live_latency(
 
     let mut matches = HashMap::<EventIdentity, EventMatchState>::new();
     let mut latencies = Vec::<i128>::new();
+    let mut direct_observations = 0usize;
+    let mut dna_pending_observations = 0usize;
 
     loop {
         tokio::select! {
             _ = ct.cancelled() => break,
             _ = &mut deadline => break,
             Some(observation) = direct_rx.recv() => {
+                direct_observations += 1;
                 record_observation(observation, true, start, &mut matches, &mut latencies);
             }
             Some(observation) = dna_rx.recv() => {
+                dna_pending_observations += 1;
                 record_observation(observation, false, start, &mut matches, &mut latencies);
             }
             else => break,
@@ -306,7 +313,7 @@ async fn run_starknet_live_latency(
     finish_latency_task(direct_task, "direct subscribeEvents").await?;
     finish_latency_task(dna_task, "DNA stream").await?;
 
-    print_latency_summary(&latencies);
+    print_latency_summary(&latencies, direct_observations, dna_pending_observations);
 
     Ok(())
 }
@@ -371,9 +378,17 @@ fn record_observation(
     );
 }
 
-fn print_latency_summary(latencies: &[i128]) {
+fn print_latency_summary(
+    latencies: &[i128],
+    direct_observations: usize,
+    dna_pending_observations: usize,
+) {
     if latencies.is_empty() {
-        println!("summary,count=0,p95DnaMinusSubscribeEventsMs=");
+        println!(
+            "summary,count=0,directObservations={},dnaPendingObservations={},p95DnaMinusSubscribeEventsMs=",
+            direct_observations,
+            dna_pending_observations,
+        );
         return;
     }
 
@@ -384,8 +399,10 @@ fn print_latency_summary(latencies: &[i128]) {
     let max = sorted[sorted.len() - 1];
 
     println!(
-        "summary,count={},p95DnaMinusSubscribeEventsMs={},maxDnaMinusSubscribeEventsMs={}",
+        "summary,count={},directObservations={},dnaPendingObservations={},p95DnaMinusSubscribeEventsMs={},maxDnaMinusSubscribeEventsMs={}",
         sorted.len(),
+        direct_observations,
+        dna_pending_observations,
         p95,
         max
     );
@@ -504,9 +521,15 @@ async fn run_dna_starknet_events(
         ..Default::default()
     };
 
+    let starting_cursor = args.starting_block.map(|block| Cursor {
+        order_key: block,
+        unique_key: Vec::new(),
+    });
+
     let mut request = StreamDataRequest {
         finality: Some(DataFinality::Pending as i32),
         filter: vec![filter.encode_to_vec()],
+        starting_cursor,
         ..Default::default()
     }
     .into_request();

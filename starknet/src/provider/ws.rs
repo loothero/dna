@@ -13,8 +13,8 @@ use starknet_rust::core::types::requests::{
     SubscriptionNewTransactionRequest,
 };
 use starknet_rust::core::types::{
-    ConfirmedBlockId, EmittedEventWithFinality, L2TransactionFinalityStatus, L2TransactionStatus,
-    TransactionReceiptWithBlockInfo, TransactionWithL2Status,
+    AddressFilter, ConfirmedBlockId, EmittedEventWithFinality, Felt, L2TransactionFinalityStatus,
+    L2TransactionStatus, TransactionReceiptWithBlockInfo, TransactionWithL2Status,
 };
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -68,6 +68,12 @@ pub struct StarknetLiveTransactionsStream {
     inner: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct StarknetLiveEventFilter {
+    pub from_address: Option<Felt>,
+    pub keys: Option<Vec<Vec<Felt>>>,
+}
+
 #[derive(Debug)]
 struct SubscribeRequest {
     block_id: ConfirmedBlockId,
@@ -110,7 +116,10 @@ impl NewHeadsStream {
 
 impl StarknetLiveTransactionsStream {
     /// Creates a new [`StarknetLiveTransactionsStream`] from a websocket URL.
-    pub async fn connect(url: &str) -> Result<Self, StarknetProviderError> {
+    pub async fn connect(
+        url: &str,
+        event_filter: Option<StarknetLiveEventFilter>,
+    ) -> Result<Self, StarknetProviderError> {
         let (ws_stream, _) = tokio_tungstenite::connect_async(url)
             .await
             .change_context(StarknetProviderError::Request)
@@ -118,19 +127,21 @@ impl StarknetLiveTransactionsStream {
 
         let (mut write, read) = ws_stream.split();
 
-        write
-            .send(
-                LiveSubscribeRequest::Events(StarknetSubscribeEventsRequest {
-                    from_address: None,
-                    keys: None,
-                    block_id: None,
-                    finality_status: Some(L2TransactionFinalityStatus::PreConfirmed),
-                })
-                .into(),
-            )
-            .await
-            .change_context(StarknetProviderError::Request)
-            .attach_printable("failed to send event subscribe request")?;
+        if let Some(event_filter) = event_filter {
+            write
+                .send(
+                    LiveSubscribeRequest::Events(StarknetSubscribeEventsRequest {
+                        from_address: event_filter.from_address.map(AddressFilter::Single),
+                        keys: event_filter.keys,
+                        block_id: None,
+                        finality_status: Some(L2TransactionFinalityStatus::PreConfirmed),
+                    })
+                    .into(),
+                )
+                .await
+                .change_context(StarknetProviderError::Request)
+                .attach_printable("failed to send event subscribe request")?;
+        }
 
         write
             .send(
@@ -519,6 +530,26 @@ mod tests {
         assert_eq!(
             transaction_request["params"]["finality_status"],
             json!(["PRE_CONFIRMED"])
+        );
+    }
+
+    #[test]
+    fn live_event_subscribe_request_serializes_address_and_key_filter() {
+        let event_request = LiveSubscribeRequest::Events(StarknetSubscribeEventsRequest {
+            from_address: Some(AddressFilter::Single(Felt::from_hex("0x1").unwrap())),
+            keys: Some(vec![vec![Felt::from_hex("0x2").unwrap()]]),
+            block_id: None,
+            finality_status: Some(L2TransactionFinalityStatus::PreConfirmed),
+        })
+        .into_string();
+
+        let event_request: serde_json::Value = serde_json::from_str(&event_request).unwrap();
+        assert_eq!(event_request["method"], "starknet_subscribeEvents");
+        assert_eq!(event_request["params"]["from_address"], json!("0x1"));
+        assert_eq!(event_request["params"]["keys"], json!([["0x2"]]));
+        assert_eq!(
+            event_request["params"]["finality_status"],
+            json!("PRE_CONFIRMED")
         );
     }
 

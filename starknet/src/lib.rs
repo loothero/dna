@@ -14,7 +14,8 @@ pub use ingestion::StarknetBlockIngestionOptions;
 pub use live::{LiveAssemblerInsert, LivePendingBlock, StarknetLiveAssembler};
 pub use provider::{
     NewEventMessage, NewHeadMessage, NewHeadsStream, NewTransactionMessage,
-    NewTransactionReceiptMessage, StarknetLiveMessage, StarknetLiveTransactionsStream,
+    NewTransactionReceiptMessage, StarknetLiveEventFilter, StarknetLiveMessage,
+    StarknetLiveTransactionsStream,
 };
 
 pub mod cli;

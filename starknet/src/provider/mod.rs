@@ -9,5 +9,6 @@ pub use self::http::{
 pub use self::models::BlockExt;
 pub use self::ws::{
     NewEventMessage, NewHeadMessage, NewHeadsStream, NewTransactionMessage,
-    NewTransactionReceiptMessage, StarknetLiveMessage, StarknetLiveTransactionsStream,
+    NewTransactionReceiptMessage, StarknetLiveEventFilter, StarknetLiveMessage,
+    StarknetLiveTransactionsStream,
 };

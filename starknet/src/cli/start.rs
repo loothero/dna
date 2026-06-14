@@ -42,6 +42,20 @@ pub struct StartCommand {
         default_value = "false"
     )]
     ws_live_ingestion_enabled: bool,
+
+    /// Contract address filter for live pre-confirmed Starknet event subscriptions.
+    #[arg(
+        long = "starknet.ws-live-event-address",
+        env = "STARKNET_WS_LIVE_EVENT_ADDRESS"
+    )]
+    ws_live_event_address: Option<String>,
+
+    /// First event key filter for live pre-confirmed Starknet event subscriptions.
+    #[arg(
+        long = "starknet.ws-live-event-key0",
+        env = "STARKNET_WS_LIVE_EVENT_KEY0"
+    )]
+    ws_live_event_key0: Option<String>,
 }
 
 impl StartCommand {
@@ -52,6 +66,8 @@ impl StartCommand {
             ingest_pending: self.ingest_pre_confirmed || self.ws_live_ingestion_enabled,
             ingest_traces: self.ingest_traces,
             live_ingestion_enabled: self.ws_live_ingestion_enabled,
+            live_event_address: self.ws_live_event_address,
+            live_event_key0: self.ws_live_event_key0,
         };
         let starknet_chain =
             StarknetChainSupport::new(provider, self.ws_url, starknet_ingestion_options);
