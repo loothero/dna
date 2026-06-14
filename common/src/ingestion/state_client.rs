@@ -3,7 +3,7 @@ use error_stack::{Result, ResultExt};
 use futures::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 
-use crate::object_store::ObjectETag;
+use crate::{chain::PendingBlockRef, object_store::ObjectETag};
 
 pub static INGESTION_PREFIX_KEY: &str = "ingestion/";
 pub static INGESTED_KEY: &str = "ingestion/ingested";
@@ -29,7 +29,7 @@ pub struct IngestionStateClient {
 pub enum IngestionStateUpdate {
     StartingBlock(u64),
     Finalized(u64),
-    Pending(Option<u64>),
+    Pending(Option<PendingBlockRef>),
     Segmented(u64),
     Grouped(u64),
     Ingested(String),
@@ -206,6 +206,21 @@ impl IngestionStateClient {
         Ok(())
     }
 
+    pub async fn put_pending_block(
+        &mut self,
+        number: u64,
+        generation: u64,
+    ) -> Result<(), IngestionStateClientError> {
+        let value = format!("{number}:{generation}");
+        self.kv_client
+            .put(PENDING_KEY, value.as_bytes())
+            .await
+            .change_context(IngestionStateClientError)
+            .attach_printable("failed to put pending block")?;
+
+        Ok(())
+    }
+
     pub async fn get_segmented(&mut self) -> Result<Option<u64>, IngestionStateClientError> {
         let response = self
             .kv_client
@@ -334,6 +349,10 @@ impl IngestionStateUpdate {
             .change_context(IngestionStateClientError)
             .attach_printable("failed to decode value")?;
 
+        Self::from_key_value(&key, &value)
+    }
+
+    fn from_key_value(key: &str, value: &str) -> Result<Option<Self>, IngestionStateClientError> {
         if key.ends_with(STARTING_BLOCK_KEY) {
             let block = value
                 .parse::<u64>()
@@ -349,15 +368,29 @@ impl IngestionStateUpdate {
         } else if key.ends_with(PENDING_KEY) {
             if value.is_empty() {
                 Ok(Some(IngestionStateUpdate::Pending(None)))
+            } else if let Some((number, generation)) = value.split_once(':') {
+                let number = number
+                    .parse::<u64>()
+                    .change_context(IngestionStateClientError)
+                    .attach_printable("failed to parse pending block number")?;
+                let generation = generation
+                    .parse::<u64>()
+                    .change_context(IngestionStateClientError)
+                    .attach_printable("failed to parse pending block generation")?;
+                Ok(Some(IngestionStateUpdate::Pending(Some(
+                    PendingBlockRef::new(number, generation),
+                ))))
             } else {
                 let generation = value
                     .parse::<u64>()
                     .change_context(IngestionStateClientError)
                     .attach_printable("failed to parse pending block generation")?;
-                Ok(Some(IngestionStateUpdate::Pending(Some(generation))))
+                Ok(Some(IngestionStateUpdate::Pending(Some(
+                    PendingBlockRef::legacy(generation),
+                ))))
             }
         } else if key.ends_with(INGESTED_KEY) {
-            Ok(Some(IngestionStateUpdate::Ingested(value)))
+            Ok(Some(IngestionStateUpdate::Ingested(value.to_string())))
         } else if key.ends_with(SEGMENTED_KEY) {
             let block = value
                 .parse::<u64>()
@@ -373,6 +406,41 @@ impl IngestionStateUpdate {
         } else {
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_legacy_pending_generation() {
+        let update = IngestionStateUpdate::from_key_value(PENDING_KEY, "7")
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            update,
+            IngestionStateUpdate::Pending(Some(PendingBlockRef {
+                number: None,
+                generation: 7
+            }))
+        ));
+    }
+
+    #[test]
+    fn parses_pending_block_number_and_generation() {
+        let update = IngestionStateUpdate::from_key_value(PENDING_KEY, "42:7")
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            update,
+            IngestionStateUpdate::Pending(Some(PendingBlockRef {
+                number: Some(42),
+                generation: 7
+            }))
+        ));
     }
 }
 

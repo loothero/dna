@@ -382,12 +382,12 @@ impl DataStream {
         tx: &mpsc::Sender<DataStreamMessage>,
         ct: &CancellationToken,
     ) -> Result<(), DataStreamError> {
-        let mut pending_generation = self.chain_view.get_pending_generation().await;
+        let mut pending_block = self.chain_view.get_pending_block().await;
         let mut content_hash = Vec::new();
         loop {
-            if let Some(generation) = pending_generation.take() {
+            if let Some(pending_block) = pending_block.take() {
                 if let Some(head) = &self.current {
-                    self.send_pending_block(head, generation, &mut content_hash, tx, ct)
+                    self.send_pending_block(head, pending_block, &mut content_hash, tx, ct)
                         .await?;
                 }
             }
@@ -407,7 +407,7 @@ impl DataStream {
                 },
                 _ = self.chain_view.pending_changed() => {
                     debug!("pending changed (pending)");
-                    pending_generation = self.chain_view.get_pending_generation().await;
+                    pending_block = self.chain_view.get_pending_block().await;
                 }
             }
         }
@@ -416,7 +416,7 @@ impl DataStream {
     async fn send_pending_block(
         &self,
         head: &Cursor,
-        generation: u64,
+        pending_block: crate::chain::PendingBlockRef,
         content_hash: &mut Vec<u8>,
         tx: &mpsc::Sender<DataStreamMessage>,
         ct: &CancellationToken,
@@ -425,7 +425,7 @@ impl DataStream {
 
         debug!("tick: pending block");
 
-        let end_cursor = Cursor::new_pending(head.number + 1);
+        let end_cursor = Cursor::new_pending(pending_block.number_after(head));
 
         debug!(cursor = %head, end_cursor = %end_cursor, "sending pending data");
 
@@ -435,13 +435,13 @@ impl DataStream {
 
         let block_entry: BlockAccess = self
             .store
-            .get_pending_block(&end_cursor, generation)
+            .get_pending_block(&end_cursor, pending_block.generation)
             .await
             .map_err(FileCacheError::Foyer)
             .change_context(DataStreamError)
             .attach_printable("failed to get pending block")
             .attach_printable_lazy(|| format!("cursor: {}", end_cursor))
-            .attach_printable_lazy(|| format!("generation: {}", generation))?
+            .attach_printable_lazy(|| format!("generation: {}", pending_block.generation))?
             .into();
 
         let fragment_access = FragmentAccess::Block(block_entry);

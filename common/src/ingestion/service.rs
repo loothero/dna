@@ -623,7 +623,7 @@ where
                     );
 
                     self.state_client
-                        .put_pending(block_info.generation)
+                        .put_pending_block(block_info.number, block_info.generation)
                         .await
                         .change_context(IngestionError::StateClientRequest)?;
 

@@ -207,8 +207,8 @@ impl ChainViewSyncService {
                         IngestionStateUpdate::Grouped(block) => {
                             chain_view.set_grouped_block(block).await;
                         }
-                        IngestionStateUpdate::Pending(generation) => {
-                            chain_view.set_pending_generation(generation).await;
+                        IngestionStateUpdate::Pending(pending_block) => {
+                            chain_view.set_pending_block(pending_block).await;
                         }
                         IngestionStateUpdate::Ingested(_etag) => {
                             chain_view.refresh_recent().await?;

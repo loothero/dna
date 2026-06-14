@@ -4,7 +4,7 @@ use error_stack::Result;
 use tokio::sync::{Notify, RwLock};
 use tracing::debug;
 
-use crate::Cursor;
+use crate::{chain::PendingBlockRef, Cursor};
 
 use super::{
     error::ChainViewError,
@@ -19,7 +19,7 @@ pub struct ChainView(Arc<RwLock<ChainViewInner>>);
 
 pub(crate) struct ChainViewInner {
     finalized: u64,
-    pending_generation: Option<u64>,
+    pending_block: Option<PendingBlockRef>,
     segmented: Option<u64>,
     grouped: Option<u64>,
     canonical: FullCanonicalChain,
@@ -44,7 +44,7 @@ impl ChainView {
         let inner = ChainViewInner {
             finalized,
             segmented,
-            pending_generation: None,
+            pending_block: None,
             grouped,
             canonical,
             segment_size,
@@ -204,9 +204,9 @@ impl ChainView {
         }
     }
 
-    pub async fn get_pending_generation(&self) -> Option<u64> {
+    pub async fn get_pending_block(&self) -> Option<PendingBlockRef> {
         let inner = self.0.read().await;
-        inner.pending_generation
+        inner.pending_block
     }
 
     pub(crate) async fn set_finalized_block(&self, block: u64) {
@@ -216,9 +216,9 @@ impl ChainView {
         inner.finalized_notify.notify_waiters();
     }
 
-    pub(crate) async fn set_pending_generation(&self, generation: Option<u64>) {
+    pub(crate) async fn set_pending_block(&self, pending_block: Option<PendingBlockRef>) {
         let mut inner = self.0.write().await;
-        inner.pending_generation = generation;
+        inner.pending_block = pending_block;
         inner.pending_notify.notify_waiters();
     }
 

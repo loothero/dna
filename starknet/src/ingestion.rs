@@ -244,10 +244,17 @@ impl BlockIngestion for StarknetBlockIngestion {
         generation: u64,
     ) -> Result<Option<(PendingBlockInfo, Block)>, IngestionError> {
         if self.options.live_ingestion_enabled {
-            let number = parent.number + 1;
             let live_block = {
                 let assembler = self.live_assembler.lock().await;
-                assembler.build_pending_block(number)?
+                let number = assembler
+                    .pending_block_numbers()
+                    .into_iter()
+                    .find(|number| *number > parent.number);
+                if let Some(number) = number {
+                    assembler.build_pending_block(number)?
+                } else {
+                    None
+                }
             };
 
             if let Some(live_block) = live_block {

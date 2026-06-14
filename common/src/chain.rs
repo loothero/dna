@@ -19,6 +19,12 @@ pub struct PendingBlockInfo {
     pub parent: Hash,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct PendingBlockRef {
+    pub number: Option<u64>,
+    pub generation: u64,
+}
+
 impl BlockInfo {
     pub fn cursor(&self) -> Cursor {
         Cursor {
@@ -53,6 +59,26 @@ impl PendingBlockInfo {
         };
 
         Some(cursor)
+    }
+}
+
+impl PendingBlockRef {
+    pub fn legacy(generation: u64) -> Self {
+        Self {
+            number: None,
+            generation,
+        }
+    }
+
+    pub fn new(number: u64, generation: u64) -> Self {
+        Self {
+            number: Some(number),
+            generation,
+        }
+    }
+
+    pub fn number_after(self, head: &Cursor) -> u64 {
+        self.number.unwrap_or(head.number + 1)
     }
 }
 
