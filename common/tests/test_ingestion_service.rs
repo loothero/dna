@@ -285,7 +285,7 @@ async fn test_ingestion_advances_as_head_changes() {
 }
 
 #[tokio::test]
-async fn test_ingestion_queues_pending_from_push_update_without_poll_interval() {
+async fn test_ingestion_prioritizes_pending_from_push_update_without_poll_interval() {
     let (_minio, object_store) = init_minio().await;
     let (_etcd_server, etcd_client) = init_etcd_server().await;
     let (_anvil_server, anvil_provider) = init_anvil().await;
@@ -322,21 +322,25 @@ async fn test_ingestion_queues_pending_from_push_update_without_poll_interval() 
     let state = service.tick_ingest(state, ct.clone()).await.unwrap();
     let state = state.take_ingest().unwrap();
 
-    assert_eq!(service.task_queue_len(), 1);
+    // Live pending ingestion is scheduled through a priority slot, not the
+    // canonical block task queue.
+    assert_eq!(service.task_queue_len(), 0);
 
-    _pending_tx.send(Ok(())).await.unwrap();
-    let state = service.tick_ingest(state, ct).await.unwrap();
+    let state = service.tick_ingest(state, ct.clone()).await.unwrap();
     let state = state.take_ingest().unwrap();
 
-    assert_eq!(service.task_queue_len(), 1);
-
-    let join_result = service.task_queue_next().await;
-    service
-        .tick_with_task_result(state, join_result)
-        .await
-        .unwrap();
-
+    assert_eq!(service.task_queue_len(), 0);
     assert_eq!(pending_ingest_count.load(Ordering::SeqCst), 1);
+
+    _pending_tx.send(Ok(())).await.unwrap();
+    let state = service.tick_ingest(state, ct.clone()).await.unwrap();
+    let state = state.take_ingest().unwrap();
+
+    assert_eq!(service.task_queue_len(), 0);
+
+    service.tick_ingest(state, ct).await.unwrap();
+
+    assert_eq!(pending_ingest_count.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

@@ -152,6 +152,7 @@ pub struct IngestState {
     new_heads_stream: Pin<Box<dyn Stream<Item = Result<Cursor, IngestionError>> + Send>>,
     pending_block_updates_stream:
         Pin<Box<dyn Stream<Item = Result<(), IngestionError>> + Send + 'static>>,
+    pending_task: Option<IngestionTaskHandle>,
 }
 
 impl fmt::Debug for IngestState {
@@ -170,6 +171,7 @@ impl fmt::Debug for IngestState {
             )
             .field("new_heads_stream", &"<stream>")
             .field("pending_block_updates_stream", &"<stream>")
+            .field("pending_task", &self.pending_task.is_some())
             .finish()
     }
 }
@@ -338,6 +340,7 @@ where
                     ),
                     new_heads_stream,
                     pending_block_updates_stream,
+                    pending_task: None,
                 }))
             }
             IngestionStartAction::Resume(starting_cursor) => {
@@ -364,6 +367,7 @@ where
                     ),
                     new_heads_stream,
                     pending_block_updates_stream,
+                    pending_task: None,
                 }))
             }
         }
@@ -387,6 +391,12 @@ where
             biased;
 
             _ = ct.cancelled() => Ok(IngestionState::Ingest(state)),
+
+            join_result = pending_task_next(&mut state.pending_task), if state.pending_task.is_some() => {
+                current_span.record("action", "finish_pending_ingestion");
+
+                self.tick_with_pending_task_result(state, join_result).await
+            }
 
             result = state.new_heads_stream.next() => {
                 match result {
@@ -564,14 +574,80 @@ where
             return Ok(IngestionState::Ingest(state));
         }
 
-        self.push_ingest_pending_block(
+        state.pending_task = Some(self.spawn_ingest_pending_block(
             state.last_ingested.clone(),
             state.pending_block_state.generation + 1,
-        );
+        ));
 
         state.pending_block_state.queued = true;
 
         Ok(IngestionState::Ingest(state))
+    }
+
+    pub async fn tick_with_pending_task_result(
+        &mut self,
+        mut state: IngestState,
+        join_result: Option<IngestionJobJoinResult>,
+    ) -> Result<IngestionState, IngestionError> {
+        state.pending_task = None;
+
+        let Some(join_result) = join_result else {
+            let new_pending_block_state = PendingBlockState {
+                queued: false,
+                generation: state.pending_block_state.generation,
+            };
+
+            return Ok(IngestionState::Ingest(IngestState {
+                pending_block_state: new_pending_block_state,
+                ..state
+            }));
+        };
+
+        let task_result = join_result
+            .change_context(IngestionError::RpcRequest)
+            .attach_printable("failed to join pending ingestion task")?;
+
+        let task_result = task_result
+            .change_context(IngestionError::RpcRequest)
+            .attach_printable("failed to ingest pending block")?;
+
+        match task_result {
+            IngestionTask::Pending(None) => {
+                let new_pending_block_state = PendingBlockState {
+                    queued: false,
+                    generation: state.pending_block_state.generation,
+                };
+
+                Ok(IngestionState::Ingest(IngestState {
+                    pending_block_state: new_pending_block_state,
+                    ..state
+                }))
+            }
+            IngestionTask::Pending(Some(block_info)) => {
+                info!(
+                    number = block_info.number,
+                    generation = block_info.generation,
+                    "ingested pending block"
+                );
+
+                self.state_client
+                    .put_pending_block(block_info.number, block_info.generation)
+                    .await
+                    .change_context(IngestionError::StateClientRequest)?;
+
+                let new_pending_block_state = PendingBlockState {
+                    queued: false,
+                    generation: block_info.generation,
+                };
+
+                Ok(IngestionState::Ingest(IngestState {
+                    pending_block_state: new_pending_block_state,
+                    ..state
+                }))
+            }
+            IngestionTask::Main(_) => Err(IngestionError::Model)
+                .attach_printable("expected pending ingestion task, got main ingestion task"),
+        }
     }
 
     pub async fn tick_with_task_result(
@@ -809,6 +885,7 @@ where
             ),
             new_heads_stream,
             pending_block_updates_stream,
+            pending_task: None,
         }))
     }
 
@@ -841,13 +918,22 @@ where
     }
 
     pub fn push_ingest_pending_block(&mut self, last_ingested: Cursor, generation: u64) {
+        let task = self.spawn_ingest_pending_block(last_ingested, generation);
+        self.task_queue.push_back(task);
+    }
+
+    fn spawn_ingest_pending_block(
+        &self,
+        last_ingested: Cursor,
+        generation: u64,
+    ) -> IngestionTaskHandle {
         let ingestion = self.ingestion.clone();
-        self.task_queue.push_back(tokio::spawn(async move {
+        tokio::spawn(async move {
             let block_info = ingestion
                 .ingest_pending_block(last_ingested, generation)
                 .await?;
             Ok(IngestionTask::Pending(block_info))
-        }));
+        })
     }
 
     pub fn current_chain_segment(&self) -> Option<CanonicalChainSegment> {
@@ -901,6 +987,12 @@ where
             Ok(IngestionStartAction::Start(starting_block))
         }
     }
+}
+
+async fn pending_task_next(
+    task: &mut Option<IngestionTaskHandle>,
+) -> Option<IngestionJobJoinResult> {
+    Some(task.as_mut()?.await)
 }
 
 impl<I> IngestionInner<I>
