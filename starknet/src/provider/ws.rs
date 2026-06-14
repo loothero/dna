@@ -6,12 +6,14 @@ use error_stack::{Result, ResultExt};
 use futures::stream::SplitStream;
 use futures::{SinkExt, Stream, StreamExt};
 use starknet_rust::core::types::requests::{
+    SubscribeEventsRequest as StarknetSubscribeEventsRequest,
     SubscribeNewTransactionReceiptsRequest as StarknetSubscribeNewTransactionReceiptsRequest,
     SubscribeNewTransactionsRequest as StarknetSubscribeNewTransactionsRequest,
-    SubscriptionNewTransactionReceiptsRequest, SubscriptionNewTransactionRequest,
+    SubscriptionEventsRequest, SubscriptionNewTransactionReceiptsRequest,
+    SubscriptionNewTransactionRequest,
 };
 use starknet_rust::core::types::{
-    ConfirmedBlockId, L2TransactionFinalityStatus, L2TransactionStatus,
+    ConfirmedBlockId, EmittedEventWithFinality, L2TransactionFinalityStatus, L2TransactionStatus,
     TransactionReceiptWithBlockInfo, TransactionWithL2Status,
 };
 use tokio::net::TcpStream;
@@ -47,11 +49,18 @@ pub struct NewTransactionMessage {
     pub transaction_index: Option<u64>,
 }
 
+/// A new event received from a Starknet websocket subscription.
+#[derive(Debug, Clone)]
+pub struct NewEventMessage {
+    pub event: EmittedEventWithFinality,
+}
+
 /// A live Starknet transaction or receipt websocket notification.
 #[derive(Debug, Clone)]
 pub enum StarknetLiveMessage {
     Transaction(NewTransactionMessage),
     Receipt(NewTransactionReceiptMessage),
+    Event(NewEventMessage),
 }
 
 /// A stream subscribed to Starknet pre-confirmed transaction bodies and receipts.
@@ -66,6 +75,7 @@ struct SubscribeRequest {
 
 #[derive(Debug)]
 enum LiveSubscribeRequest {
+    Events(StarknetSubscribeEventsRequest),
     NewTransactionReceipts(StarknetSubscribeNewTransactionReceiptsRequest),
     NewTransactions(StarknetSubscribeNewTransactionsRequest),
 }
@@ -107,6 +117,20 @@ impl StarknetLiveTransactionsStream {
             .attach_printable("failed to connect to ws stream")?;
 
         let (mut write, read) = ws_stream.split();
+
+        write
+            .send(
+                LiveSubscribeRequest::Events(StarknetSubscribeEventsRequest {
+                    from_address: None,
+                    keys: None,
+                    block_id: None,
+                    finality_status: Some(L2TransactionFinalityStatus::PreConfirmed),
+                })
+                .into(),
+            )
+            .await
+            .change_context(StarknetProviderError::Request)
+            .attach_printable("failed to send event subscribe request")?;
 
         write
             .send(
@@ -218,6 +242,15 @@ impl StarknetLiveMessage {
         };
 
         match method {
+            "starknet_subscriptionEvents" => {
+                let update: SubscriptionEventsRequest = serde_json::from_value(params)
+                    .change_context(StarknetProviderError::Request)
+                    .attach_printable("failed to parse event notification")?;
+
+                Ok(Some(Self::Event(NewEventMessage {
+                    event: update.result,
+                })))
+            }
             "starknet_subscriptionNewTransactionReceipts" => {
                 let transaction_index = extract_result_u64(&params, "transaction_index");
                 let update: SubscriptionNewTransactionReceiptsRequest =
@@ -348,13 +381,18 @@ impl LiveSubscribeRequest {
         use serde_json::json;
 
         let (id, method, params) = match self {
-            Self::NewTransactionReceipts(request) => (
+            Self::Events(request) => (
                 1,
+                "starknet_subscribeEvents",
+                serde_json::to_value(request).expect("serialization"),
+            ),
+            Self::NewTransactionReceipts(request) => (
+                2,
                 "starknet_subscribeNewTransactionReceipts",
                 serde_json::to_value(request).expect("serialization"),
             ),
             Self::NewTransactions(request) => (
-                2,
+                3,
                 "starknet_subscribeNewTransactions",
                 serde_json::to_value(request).expect("serialization"),
             ),
@@ -419,8 +457,35 @@ mod tests {
         })
     }
 
+    fn event_result(hash: &str) -> serde_json::Value {
+        json!({
+            "from_address": "0x1",
+            "keys": ["0x2"],
+            "data": ["0x3"],
+            "block_number": 10,
+            "transaction_hash": hash,
+            "transaction_index": 4,
+            "event_index": 5,
+            "finality_status": "PRE_CONFIRMED"
+        })
+    }
+
     #[test]
     fn live_subscribe_requests_use_pre_confirmed_filters() {
+        let event_request = LiveSubscribeRequest::Events(StarknetSubscribeEventsRequest {
+            from_address: None,
+            keys: None,
+            block_id: None,
+            finality_status: Some(L2TransactionFinalityStatus::PreConfirmed),
+        })
+        .into_string();
+        let event_request: serde_json::Value = serde_json::from_str(&event_request).unwrap();
+        assert_eq!(event_request["method"], "starknet_subscribeEvents");
+        assert_eq!(
+            event_request["params"]["finality_status"],
+            json!("PRE_CONFIRMED")
+        );
+
         let receipt_request = LiveSubscribeRequest::NewTransactionReceipts(
             StarknetSubscribeNewTransactionReceiptsRequest {
                 finality_status: Some(vec![L2TransactionFinalityStatus::PreConfirmed]),
@@ -532,6 +597,33 @@ mod tests {
         assert_eq!(
             parsed.transaction.finality_status,
             L2TransactionStatus::PreConfirmed
+        );
+    }
+
+    #[test]
+    fn parses_event_notification() {
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": "starknet_subscriptionEvents",
+            "params": {
+                "subscription_id": "0x3",
+                "result": event_result("0x123")
+            }
+        });
+
+        let parsed =
+            StarknetLiveMessage::try_from_message(Message::Text(message.to_string().into()))
+                .unwrap();
+
+        let Some(StarknetLiveMessage::Event(parsed)) = parsed else {
+            panic!("expected event notification");
+        };
+        assert_eq!(parsed.event.emitted_event.block_number, Some(10));
+        assert_eq!(parsed.event.emitted_event.transaction_index, 4);
+        assert_eq!(parsed.event.emitted_event.event_index, 5);
+        assert_eq!(
+            parsed.event.finality_status,
+            TransactionFinalityStatus::PreConfirmed
         );
     }
 }

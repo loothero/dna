@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use apibara_dna_common::{
     chain::{BlockInfo, PendingBlockInfo},
@@ -245,16 +245,8 @@ impl BlockIngestion for StarknetBlockIngestion {
     ) -> Result<Option<(PendingBlockInfo, Block)>, IngestionError> {
         if self.options.live_ingestion_enabled {
             let live_block = {
-                let assembler = self.live_assembler.lock().await;
-                let number = assembler
-                    .pending_block_numbers()
-                    .into_iter()
-                    .find(|number| *number > parent.number);
-                if let Some(number) = number {
-                    assembler.build_pending_block(number)?
-                } else {
-                    None
-                }
+                let mut assembler = self.live_assembler.lock().await;
+                assembler.build_next_pending_block(parent.number)?
             };
 
             if let Some(live_block) = live_block {
@@ -539,6 +531,201 @@ pub(crate) fn collect_receipts_body_and_index(
     let receipts = receipts.iter().collect::<Vec<_>>();
 
     collect_block_records_body_and_index(&receipts, None, &[])
+}
+
+pub(crate) fn collect_events_body_and_index(
+    events: &[models::EmittedEventWithFinality],
+) -> Result<BlockIngestionResult, IngestionError> {
+    let mut block_events = Vec::new();
+
+    let mut index_event_by_address = BitmapIndexBuilder::default();
+    let mut index_event_by_key0 = BitmapIndexBuilder::default();
+    let mut index_event_by_key1 = BitmapIndexBuilder::default();
+    let mut index_event_by_key2 = BitmapIndexBuilder::default();
+    let mut index_event_by_key3 = BitmapIndexBuilder::default();
+    let mut index_event_by_key_length = BitmapIndexBuilder::default();
+    let mut index_event_by_transaction_status = BitmapIndexBuilder::default();
+    let join_event_to_transaction = JoinToOneIndexBuilder::default();
+    let join_event_to_receipt = JoinToOneIndexBuilder::default();
+    let mut join_event_to_siblings = JoinToManyIndexBuilder::default();
+    let join_event_to_messages = JoinToManyIndexBuilder::default();
+    let join_event_to_trace = JoinToOneIndexBuilder::default();
+    let mut transaction_events = HashMap::<models::FieldElement, Vec<u32>>::new();
+
+    for event in events {
+        let source = &event.emitted_event;
+        let event_index = block_events.len() as u32;
+        let transaction_status = starknet::TransactionStatus::Succeeded;
+
+        let event = starknet::Event {
+            filter_ids: Vec::default(),
+            from_address: Some(source.from_address.to_proto()),
+            keys: source.keys.iter().map(ModelExt::to_proto).collect(),
+            data: source.data.iter().map(ModelExt::to_proto).collect(),
+            event_index,
+            transaction_index: source.transaction_index as u32,
+            transaction_hash: Some(source.transaction_hash.to_proto()),
+            transaction_status: transaction_status as i32,
+            event_index_in_transaction: source.event_index as u32,
+        };
+
+        transaction_events
+            .entry(source.transaction_hash)
+            .or_default()
+            .push(event.event_index);
+
+        if let Some(address) = event.from_address {
+            index_event_by_address.insert(ScalarValue::B256(address.to_bytes()), event.event_index);
+        }
+
+        let mut keys = event.keys.iter();
+
+        if let Some(key) = keys.next() {
+            index_event_by_key0.insert(ScalarValue::B256(key.to_bytes()), event.event_index);
+        }
+        if let Some(key) = keys.next() {
+            index_event_by_key1.insert(ScalarValue::B256(key.to_bytes()), event.event_index);
+        }
+        if let Some(key) = keys.next() {
+            index_event_by_key2.insert(ScalarValue::B256(key.to_bytes()), event.event_index);
+        }
+        if let Some(key) = keys.next() {
+            index_event_by_key3.insert(ScalarValue::B256(key.to_bytes()), event.event_index);
+        }
+
+        index_event_by_key_length.insert(
+            ScalarValue::Uint32(event.keys.len() as u32),
+            event.event_index,
+        );
+
+        index_event_by_transaction_status.insert(
+            ScalarValue::Int32(transaction_status as i32),
+            event.event_index,
+        );
+
+        block_events.push(event);
+    }
+
+    for event_ids in transaction_events.values() {
+        for event_id in event_ids.iter() {
+            for sibling_id in event_ids.iter() {
+                if event_id != sibling_id {
+                    join_event_to_siblings.insert(*event_id, *sibling_id);
+                }
+            }
+        }
+    }
+
+    let event_index = {
+        let index_event_by_address = Index {
+            index_id: INDEX_EVENT_BY_ADDRESS,
+            index: index_event_by_address
+                .build()
+                .change_context(IngestionError::Indexing)?
+                .into(),
+        };
+        let index_event_by_key0 = Index {
+            index_id: INDEX_EVENT_BY_KEY0,
+            index: index_event_by_key0
+                .build()
+                .change_context(IngestionError::Indexing)?
+                .into(),
+        };
+        let index_event_by_key1 = Index {
+            index_id: INDEX_EVENT_BY_KEY1,
+            index: index_event_by_key1
+                .build()
+                .change_context(IngestionError::Indexing)?
+                .into(),
+        };
+        let index_event_by_key2 = Index {
+            index_id: INDEX_EVENT_BY_KEY2,
+            index: index_event_by_key2
+                .build()
+                .change_context(IngestionError::Indexing)?
+                .into(),
+        };
+        let index_event_by_key3 = Index {
+            index_id: INDEX_EVENT_BY_KEY3,
+            index: index_event_by_key3
+                .build()
+                .change_context(IngestionError::Indexing)?
+                .into(),
+        };
+        let index_event_by_key_length = Index {
+            index_id: INDEX_EVENT_BY_KEY_LENGTH,
+            index: index_event_by_key_length
+                .build()
+                .change_context(IngestionError::Indexing)?
+                .into(),
+        };
+        let index_event_by_transaction_status = Index {
+            index_id: INDEX_EVENT_BY_TRANSACTION_STATUS,
+            index: index_event_by_transaction_status
+                .build()
+                .change_context(IngestionError::Indexing)?
+                .into(),
+        };
+
+        IndexFragment {
+            fragment_id: EVENT_FRAGMENT_ID,
+            range_start: 0,
+            range_len: block_events.len() as u32,
+            indexes: vec![
+                index_event_by_address,
+                index_event_by_key0,
+                index_event_by_key1,
+                index_event_by_key2,
+                index_event_by_key3,
+                index_event_by_key_length,
+                index_event_by_transaction_status,
+            ],
+        }
+    };
+
+    let event_join = JoinFragment {
+        fragment_id: EVENT_FRAGMENT_ID,
+        joins: vec![
+            Join {
+                to_fragment_id: TRANSACTION_FRAGMENT_ID,
+                index: join_event_to_transaction.build().into(),
+            },
+            Join {
+                to_fragment_id: RECEIPT_FRAGMENT_ID,
+                index: join_event_to_receipt.build().into(),
+            },
+            Join {
+                to_fragment_id: EVENT_FRAGMENT_ID,
+                index: join_event_to_siblings
+                    .build()
+                    .change_context(IngestionError::Indexing)?
+                    .into(),
+            },
+            Join {
+                to_fragment_id: MESSAGE_FRAGMENT_ID,
+                index: join_event_to_messages
+                    .build()
+                    .change_context(IngestionError::Indexing)?
+                    .into(),
+            },
+            Join {
+                to_fragment_id: TRACE_FRAGMENT_ID,
+                index: join_event_to_trace.build().into(),
+            },
+        ],
+    };
+
+    let event_fragment = BodyFragment {
+        fragment_id: EVENT_FRAGMENT_ID,
+        name: EVENT_FRAGMENT_NAME.to_string(),
+        data: block_events.iter().map(Message::encode_to_vec).collect(),
+    };
+
+    Ok(BlockIngestionResult {
+        body: vec![event_fragment],
+        index: vec![event_index],
+        join: vec![event_join],
+    })
 }
 
 fn collect_block_records_body_and_index(

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use apibara_dna_common::fragment::{Block, HeaderFragment, IndexGroupFragment, JoinGroupFragment};
 use apibara_dna_common::ingestion::IngestionError;
@@ -8,10 +8,13 @@ use prost::Message;
 
 use crate::{
     ingestion::{
-        collect_block_body_and_index, collect_receipts_body_and_index,
-        collect_state_update_body_and_index,
+        collect_block_body_and_index, collect_events_body_and_index,
+        collect_receipts_body_and_index, collect_state_update_body_and_index,
     },
-    provider::{models, NewTransactionMessage, NewTransactionReceiptMessage, StarknetLiveMessage},
+    provider::{
+        models, NewEventMessage, NewTransactionMessage, NewTransactionReceiptMessage,
+        StarknetLiveMessage,
+    },
 };
 
 /// Result of inserting a live transaction or receipt into the assembler.
@@ -34,7 +37,21 @@ pub struct LivePendingBlock {
 #[derive(Debug, Default)]
 pub struct StarknetLiveAssembler {
     entries: HashMap<models::FieldElement, LiveEntry>,
+    event_entries: HashMap<LiveEventKey, LiveEventEntry>,
+    pending_updates: VecDeque<LivePendingUpdate>,
     next_arrival_order: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LivePendingUpdateMode {
+    Events,
+    Records,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LivePendingUpdate {
+    block_number: u64,
+    mode: LivePendingUpdateMode,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +60,21 @@ struct LiveEntry {
     receipt: Option<models::TransactionReceiptWithBlockInfo>,
     block_number: Option<u64>,
     transaction_index: Option<u64>,
+    arrival_order: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct LiveEventKey {
+    transaction_hash: models::FieldElement,
+    event_index: u64,
+}
+
+#[derive(Debug, Clone)]
+struct LiveEventEntry {
+    event: models::EmittedEventWithFinality,
+    block_number: u64,
+    transaction_index: u64,
+    event_index: u64,
     arrival_order: u64,
 }
 
@@ -55,7 +87,52 @@ impl StarknetLiveAssembler {
         match message {
             StarknetLiveMessage::Transaction(message) => self.push_transaction(message),
             StarknetLiveMessage::Receipt(message) => self.push_receipt(message),
+            StarknetLiveMessage::Event(message) => self.push_event(message),
         }
+    }
+
+    pub fn push_event(&mut self, message: NewEventMessage) -> LiveAssemblerInsert {
+        self.push_event_with_meta(message.event)
+    }
+
+    pub fn push_event_with_meta(
+        &mut self,
+        event: models::EmittedEventWithFinality,
+    ) -> LiveAssemblerInsert {
+        let source = &event.emitted_event;
+        let Some(block_number) = source.block_number else {
+            return LiveAssemblerInsert::Duplicate;
+        };
+        let transaction_hash = source.transaction_hash;
+        let event_index = source.event_index;
+        let transaction_index = source.transaction_index;
+        let key = LiveEventKey {
+            transaction_hash,
+            event_index,
+        };
+
+        if self.event_entries.contains_key(&key) {
+            return LiveAssemblerInsert::Duplicate;
+        }
+
+        let arrival_order = self.next_arrival_order;
+        self.next_arrival_order += 1;
+        self.event_entries.insert(
+            key,
+            LiveEventEntry {
+                event,
+                block_number,
+                transaction_index,
+                event_index,
+                arrival_order,
+            },
+        );
+        self.pending_updates.push_back(LivePendingUpdate {
+            block_number,
+            mode: LivePendingUpdateMode::Events,
+        });
+
+        LiveAssemblerInsert::Inserted
     }
 
     pub fn push_transaction(&mut self, message: NewTransactionMessage) -> LiveAssemblerInsert {
@@ -105,6 +182,13 @@ impl StarknetLiveAssembler {
             changed = true;
         }
 
+        if changed {
+            self.pending_updates.push_back(LivePendingUpdate {
+                block_number: block_number.unwrap(),
+                mode: LivePendingUpdateMode::Records,
+            });
+        }
+
         insertion_result(was_new, changed)
     }
 
@@ -119,6 +203,16 @@ impl StarknetLiveAssembler {
                     .map(|receipt| receipt.block.block_number())
             })
             .collect::<Vec<_>>();
+        block_numbers.extend(
+            self.event_entries
+                .values()
+                .map(|entry| entry.block_number)
+                .chain(
+                    self.pending_updates
+                        .iter()
+                        .map(|update| update.block_number),
+                ),
+        );
         block_numbers.sort_unstable();
         block_numbers.dedup();
         block_numbers
@@ -132,6 +226,42 @@ impl StarknetLiveAssembler {
                 .map(|receipt| receipt.block.block_number() > block_number)
                 .unwrap_or(true)
         });
+        self.event_entries
+            .retain(|_, entry| entry.block_number > block_number);
+        self.pending_updates
+            .retain(|update| update.block_number > block_number);
+    }
+
+    pub fn build_next_pending_block(
+        &mut self,
+        after_block_number: u64,
+    ) -> Result<Option<LivePendingBlock>, IngestionError> {
+        while let Some(update) = self.pending_updates.pop_front() {
+            if update.block_number <= after_block_number {
+                continue;
+            }
+
+            let block = match update.mode {
+                LivePendingUpdateMode::Events => {
+                    self.build_event_pending_block(update.block_number)?
+                }
+                LivePendingUpdateMode::Records => self.build_pending_block(update.block_number)?,
+            };
+
+            if block.is_some() {
+                return Ok(block);
+            }
+        }
+
+        let block_number = self
+            .pending_block_numbers()
+            .into_iter()
+            .find(|number| *number > after_block_number);
+        if let Some(block_number) = block_number {
+            self.build_pending_block(block_number)
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn build_pending_block(
@@ -171,6 +301,80 @@ impl StarknetLiveAssembler {
             collect_receipts_body_and_index(&receipts)?
         };
 
+        let state_update_ingestion_result =
+            collect_state_update_body_and_index(&empty_state_diff())?;
+
+        let mut body_fragments = body_ingestion_result.body;
+        let mut index_fragments = body_ingestion_result.index;
+        let mut join_fragments = body_ingestion_result.join;
+
+        body_fragments.extend(state_update_ingestion_result.body);
+        index_fragments.extend(state_update_ingestion_result.index);
+        join_fragments.extend(state_update_ingestion_result.join);
+
+        let header = starknet::BlockHeader {
+            block_number,
+            ..Default::default()
+        };
+
+        Ok(Some(LivePendingBlock {
+            block_number,
+            transaction_hashes,
+            block: Block {
+                header: HeaderFragment {
+                    data: header.encode_to_vec(),
+                },
+                index: IndexGroupFragment {
+                    indexes: index_fragments,
+                },
+                body: body_fragments,
+                join: JoinGroupFragment {
+                    joins: join_fragments,
+                },
+            },
+        }))
+    }
+
+    fn build_event_pending_block(
+        &self,
+        block_number: u64,
+    ) -> Result<Option<LivePendingBlock>, IngestionError> {
+        let mut entries = self
+            .event_entries
+            .values()
+            .filter(|entry| entry.block_number == block_number)
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            return Ok(None);
+        }
+
+        entries.sort_by_key(|entry| {
+            (
+                entry.transaction_index,
+                entry.event_index,
+                entry.arrival_order,
+            )
+        });
+
+        let transaction_hashes = entries
+            .iter()
+            .map(|entry| entry.event.emitted_event.transaction_hash)
+            .collect::<Vec<_>>();
+        let events = entries
+            .iter()
+            .map(|entry| entry.event.clone())
+            .collect::<Vec<_>>();
+
+        let body_ingestion_result = collect_events_body_and_index(&events)?;
+        self.finish_pending_block(block_number, transaction_hashes, body_ingestion_result)
+    }
+
+    fn finish_pending_block(
+        &self,
+        block_number: u64,
+        transaction_hashes: Vec<models::FieldElement>,
+        body_ingestion_result: crate::ingestion::BlockIngestionResult,
+    ) -> Result<Option<LivePendingBlock>, IngestionError> {
         let state_update_ingestion_result =
             collect_state_update_body_and_index(&empty_state_diff())?;
 
@@ -300,9 +504,9 @@ fn empty_state_diff() -> models::StateDiff {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fragment::{RECEIPT_FRAGMENT_ID, TRANSACTION_FRAGMENT_ID};
+    use crate::fragment::{EVENT_FRAGMENT_ID, RECEIPT_FRAGMENT_ID, TRANSACTION_FRAGMENT_ID};
     use starknet_rust::core::types::{
-        ExecutionResources, FeePayment, InvokeTransaction, InvokeTransactionReceipt,
+        EmittedEvent, ExecutionResources, FeePayment, InvokeTransaction, InvokeTransactionReceipt,
         InvokeTransactionV1, PriceUnit, TransactionFinalityStatus,
     };
 
@@ -343,6 +547,27 @@ mod tests {
                 execution_result: models::ExecutionResult::Succeeded,
             }),
             block: models::ReceiptBlock::PreConfirmed { block_number },
+        }
+    }
+
+    fn emitted_event(
+        hash: u64,
+        block_number: u64,
+        transaction_index: u64,
+        event_index: u64,
+    ) -> models::EmittedEventWithFinality {
+        models::EmittedEventWithFinality {
+            emitted_event: EmittedEvent {
+                from_address: felt(1),
+                keys: vec![felt(2)],
+                data: vec![felt(3)],
+                block_hash: None,
+                block_number: Some(block_number),
+                transaction_hash: felt(hash),
+                transaction_index,
+                event_index,
+            },
+            finality_status: TransactionFinalityStatus::PreConfirmed,
         }
     }
 
@@ -410,6 +635,28 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn emits_event_only_block_from_event_subscription() {
+        let mut assembler = StarknetLiveAssembler::new();
+
+        assert_eq!(
+            assembler.push_event_with_meta(emitted_event(1, 10, 0, 0)),
+            LiveAssemblerInsert::Inserted
+        );
+
+        let pending = assembler.build_next_pending_block(9).unwrap().unwrap();
+        assert_eq!(pending.block_number, 10);
+        assert_eq!(
+            body_fragment(&pending.block, EVENT_FRAGMENT_ID).data.len(),
+            1
+        );
+        assert!(!pending
+            .block
+            .body
+            .iter()
+            .any(|fragment| fragment.fragment_id == RECEIPT_FRAGMENT_ID));
     }
 
     #[test]

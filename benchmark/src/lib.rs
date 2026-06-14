@@ -538,6 +538,9 @@ async fn run_dna_starknet_events(
         let finality = DataFinality::try_from(data.finality)
             .map(|f| format!("{f:?}"))
             .unwrap_or_else(|_| format!("UNKNOWN({})", data.finality));
+        if data.finality != DataFinality::Pending as i32 {
+            continue;
+        }
 
         for block_bytes in data.data {
             let block = starknet::Block::decode(block_bytes.as_ref())
