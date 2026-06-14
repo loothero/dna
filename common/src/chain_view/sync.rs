@@ -3,6 +3,7 @@ use std::time::Duration;
 use apibara_etcd::EtcdClient;
 use error_stack::{Result, ResultExt};
 use futures::TryStreamExt;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -20,6 +21,7 @@ pub struct ChainViewSyncService {
     tx: tokio::sync::watch::Sender<Option<ChainView>>,
     etcd_client: EtcdClient,
     chain_store: ChainStore,
+    local_state_updates: Option<mpsc::Receiver<IngestionStateUpdate>>,
 }
 
 impl ChainViewSyncService {
@@ -28,16 +30,18 @@ impl ChainViewSyncService {
         chain_file_cache: FileCache,
         etcd_client: EtcdClient,
         object_store: ObjectStore,
+        local_state_updates: Option<mpsc::Receiver<IngestionStateUpdate>>,
     ) -> Self {
         let chain_store = ChainStore::new(object_store, chain_file_cache);
         Self {
             tx,
             etcd_client,
             chain_store,
+            local_state_updates,
         }
     }
 
-    pub async fn start(self, ct: CancellationToken) -> Result<(), ChainViewError> {
+    pub async fn start(mut self, ct: CancellationToken) -> Result<(), ChainViewError> {
         info!("chain_view: starting chain view sync service");
         let mut ingestion_state_client = IngestionStateClient::new(&self.etcd_client);
 
@@ -182,45 +186,33 @@ impl ChainViewSyncService {
 
                 info!("chain_view: streaming state changes");
                 chain_view.record_is_up().await?;
-                while let Some(update) = state_changes
-                    .try_next()
-                    .await
-                    .change_context(ChainViewError)?
-                {
-                    if !update.is_pending() {
-                        info!(update = ?update, "chain_view: sync update");
-                    } else {
-                        debug!(update = ?update, "chain_view: sync update");
-                    }
+                loop {
+                    tokio::select! {
+                        update = state_changes.try_next() => {
+                            let Some(update) = update.change_context(ChainViewError)? else {
+                                return Err(ChainViewError)
+                                    .attach_printable("chain view loop ended");
+                            };
 
-                    match update {
-                        IngestionStateUpdate::StartingBlock(block) => {
-                            // The starting block should never be updated.
-                            warn!(starting_block = block, "chain view starting block updated");
+                            apply_state_update(&chain_view, update).await?;
+                            self.tx
+                                .send(Some(chain_view.clone()))
+                                .change_context(ChainViewError)?;
                         }
-                        IngestionStateUpdate::Finalized(block) => {
-                            chain_view.set_finalized_block(block).await;
-                        }
-                        IngestionStateUpdate::Segmented(block) => {
-                            chain_view.set_segmented_block(block).await;
-                        }
-                        IngestionStateUpdate::Grouped(block) => {
-                            chain_view.set_grouped_block(block).await;
-                        }
-                        IngestionStateUpdate::Pending(pending_block) => {
-                            chain_view.set_pending_block(pending_block).await;
-                        }
-                        IngestionStateUpdate::Ingested(_etag) => {
-                            chain_view.refresh_recent().await?;
+                        update = recv_local_state_update(&mut self.local_state_updates) => {
+                            let Some(update) = update else {
+                                self.local_state_updates = None;
+                                continue;
+                            };
+
+                            debug!(update = ?update, "chain_view: local sync update");
+                            apply_state_update(&chain_view, update).await?;
+                            self.tx
+                                .send(Some(chain_view.clone()))
+                                .change_context(ChainViewError)?;
                         }
                     }
-
-                    self.tx
-                        .send(Some(chain_view.clone()))
-                        .change_context(ChainViewError)?;
                 }
-
-                Err(ChainViewError).attach_printable("chain view loop ended")
             }
             .await;
 
@@ -244,6 +236,7 @@ pub async fn chain_view_sync_loop(
     chain_file_cache: FileCache,
     etcd_client: EtcdClient,
     object_store: ObjectStore,
+    local_state_updates: Option<mpsc::Receiver<IngestionStateUpdate>>,
 ) -> Result<
     (
         tokio::sync::watch::Receiver<Option<ChainView>>,
@@ -253,7 +246,58 @@ pub async fn chain_view_sync_loop(
 > {
     let (tx, rx) = tokio::sync::watch::channel(None);
 
-    let sync_service = ChainViewSyncService::new(tx, chain_file_cache, etcd_client, object_store);
+    let sync_service = ChainViewSyncService::new(
+        tx,
+        chain_file_cache,
+        etcd_client,
+        object_store,
+        local_state_updates,
+    );
 
     Ok((rx, sync_service))
+}
+
+async fn apply_state_update(
+    chain_view: &ChainView,
+    update: IngestionStateUpdate,
+) -> Result<(), ChainViewError> {
+    if !update.is_pending() {
+        info!(update = ?update, "chain_view: sync update");
+    } else {
+        debug!(update = ?update, "chain_view: sync update");
+    }
+
+    match update {
+        IngestionStateUpdate::StartingBlock(block) => {
+            // The starting block should never be updated.
+            warn!(starting_block = block, "chain view starting block updated");
+        }
+        IngestionStateUpdate::Finalized(block) => {
+            chain_view.set_finalized_block(block).await;
+        }
+        IngestionStateUpdate::Segmented(block) => {
+            chain_view.set_segmented_block(block).await;
+        }
+        IngestionStateUpdate::Grouped(block) => {
+            chain_view.set_grouped_block(block).await;
+        }
+        IngestionStateUpdate::Pending(pending_block) => {
+            chain_view.set_pending_block(pending_block).await;
+        }
+        IngestionStateUpdate::Ingested(_etag) => {
+            chain_view.refresh_recent().await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn recv_local_state_update(
+    local_state_updates: &mut Option<mpsc::Receiver<IngestionStateUpdate>>,
+) -> Option<IngestionStateUpdate> {
+    let Some(local_state_updates) = local_state_updates else {
+        std::future::pending().await
+    };
+
+    local_state_updates.recv().await
 }

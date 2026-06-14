@@ -109,6 +109,8 @@ mod server_impl {
         let etcd_renew_handle =
             tokio::spawn(etcd_client.clone().start_renew_auth_token(ct.clone()));
 
+        let (local_state_update_tx, local_state_update_rx) = tokio::sync::mpsc::channel(1024);
+
         let ingestion_handle = if args.ingestion.ingestion_enabled {
             let ingestion = chain_support.block_ingestion();
             tokio::spawn(ingestion_service_loop(
@@ -117,6 +119,7 @@ mod server_impl {
                 object_store.clone(),
                 file_cache.clone(),
                 ingestion_options,
+                Some(local_state_update_tx),
                 ct.clone(),
             ))
         } else {
@@ -133,6 +136,7 @@ mod server_impl {
             file_cache.clone(),
             etcd_client.clone(),
             object_store.clone(),
+            Some(local_state_update_rx),
         )
         .await
         .change_context(ServerError)

@@ -31,6 +31,7 @@ pub async fn ingestion_service_loop<I>(
     object_store: ObjectStore,
     file_cache: FileCache,
     options: IngestionServiceOptions,
+    local_state_updates: Option<tokio::sync::mpsc::Sender<IngestionStateUpdate>>,
     ct: CancellationToken,
 ) -> Result<(), IngestionError>
 where
@@ -86,7 +87,7 @@ where
                 .attach_printable("failed to set chain segment size options")?;
         }
 
-        let ingestion_service = IngestionService::new(
+        let mut ingestion_service = IngestionService::new(
             ingestion.clone(),
             etcd_client.clone(),
             object_store.clone(),
@@ -94,6 +95,9 @@ where
             options.clone(),
             metrics.clone(),
         );
+        if let Some(local_state_updates) = local_state_updates.clone() {
+            ingestion_service = ingestion_service.with_local_state_updates(local_state_updates);
+        }
 
         match ingestion_service.start(&mut lock, ct.clone()).await {
             Ok(_) => {

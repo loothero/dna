@@ -11,6 +11,7 @@ use apibara_observability::{KeyValue, RecordRequest};
 use error_stack::{Result, ResultExt};
 use futures::{stream::FuturesOrdered, Stream, StreamExt};
 use tokio::{
+    sync::mpsc,
     task::{JoinError, JoinHandle},
     time::Interval,
 };
@@ -19,7 +20,9 @@ use tracing::{debug, field, info, trace, warn, Instrument};
 
 use crate::{
     block_store::BlockStoreWriter,
-    chain::{BlockInfo, CanonicalChainBuilder, CanonicalChainSegment, PendingBlockInfo},
+    chain::{
+        BlockInfo, CanonicalChainBuilder, CanonicalChainSegment, PendingBlockInfo, PendingBlockRef,
+    },
     chain_store::ChainStore,
     file_cache::FileCache,
     fragment::Block,
@@ -28,7 +31,11 @@ use crate::{
     Cursor,
 };
 
-use super::{error::IngestionError, metrics::IngestionMetrics, state_client::IngestionStateClient};
+use super::{
+    error::IngestionError,
+    metrics::IngestionMetrics,
+    state_client::{IngestionStateClient, IngestionStateUpdate},
+};
 
 pub type BoxedNewHeadsStream =
     Pin<Box<dyn Stream<Item = Result<Cursor, IngestionError>> + Send + 'static>>;
@@ -108,6 +115,7 @@ where
     options: IngestionServiceOptions,
     ingestion: IngestionInner<I>,
     state_client: IngestionStateClient,
+    local_state_updates: Option<mpsc::Sender<IngestionStateUpdate>>,
     chain_store: ChainStore,
     chain_builder: CanonicalChainBuilder,
     task_queue: FuturesOrdered<IngestionTaskHandle>,
@@ -217,11 +225,20 @@ where
                 metrics: metrics.clone(),
             },
             state_client,
+            local_state_updates: None,
             chain_store,
             chain_builder: CanonicalChainBuilder::new(),
             task_queue: FuturesOrdered::new(),
             metrics,
         }
+    }
+
+    pub fn with_local_state_updates(
+        mut self,
+        local_state_updates: mpsc::Sender<IngestionStateUpdate>,
+    ) -> Self {
+        self.local_state_updates = Some(local_state_updates);
+        self
     }
 
     pub async fn start(
@@ -630,6 +647,10 @@ where
                     "ingested pending block"
                 );
 
+                self.notify_local_state_update(IngestionStateUpdate::Pending(Some(
+                    PendingBlockRef::new(block_info.number, block_info.generation),
+                )));
+
                 self.state_client
                     .put_pending_block(block_info.number, block_info.generation)
                     .await
@@ -697,6 +718,10 @@ where
                         generation = block_info.generation,
                         "ingested pending block"
                     );
+
+                    self.notify_local_state_update(IngestionStateUpdate::Pending(Some(
+                        PendingBlockRef::new(block_info.number, block_info.generation),
+                    )));
 
                     self.state_client
                         .put_pending_block(block_info.number, block_info.generation)
@@ -903,6 +928,19 @@ where
 
     pub fn task_queue_next(&mut self) -> impl Future<Output = Option<IngestionJobJoinResult>> + '_ {
         self.task_queue.next()
+    }
+
+    fn notify_local_state_update(&self, update: IngestionStateUpdate) {
+        let Some(local_state_updates) = &self.local_state_updates else {
+            return;
+        };
+
+        if let Err(error) = local_state_updates.try_send(update) {
+            warn!(
+                error = ?error,
+                "failed to publish local ingestion state update"
+            );
+        }
     }
 
     pub fn can_push_task(&self) -> bool {

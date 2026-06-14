@@ -41,9 +41,10 @@ pub async fn run_debug_prefetch_stream(
         .change_context(DebugCommandError)?;
 
     let block_store = BlockStoreReader::new(object_store.clone(), file_cache.clone());
-    let (chain_view, chain_view_sync) = chain_view_sync_loop(file_cache, etcd_client, object_store)
-        .await
-        .change_context(DebugCommandError)?;
+    let (chain_view, chain_view_sync) =
+        chain_view_sync_loop(file_cache, etcd_client, object_store, None)
+            .await
+            .change_context(DebugCommandError)?;
 
     let mut sync_handle = tokio::spawn(chain_view_sync.start(ct.clone()));
 

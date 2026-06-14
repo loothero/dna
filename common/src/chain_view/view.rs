@@ -218,6 +218,10 @@ impl ChainView {
 
     pub(crate) async fn set_pending_block(&self, pending_block: Option<PendingBlockRef>) {
         let mut inner = self.0.write().await;
+        if inner.pending_block == pending_block {
+            return;
+        }
+
         inner.pending_block = pending_block;
         inner.pending_notify.notify_waiters();
     }
