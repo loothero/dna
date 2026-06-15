@@ -36,13 +36,46 @@ pub struct LivePendingBlock {
     pub block: Block,
 }
 
+/// Memory bounds for the live Starknet assembler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveAssemblerLimits {
+    pub max_entries: usize,
+    pub max_event_entries: usize,
+    pub max_pending_updates: usize,
+    pub max_unmatched_entry_age: u64,
+}
+
+impl Default for LiveAssemblerLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: 50_000,
+            max_event_entries: 50_000,
+            max_pending_updates: 100_000,
+            max_unmatched_entry_age: 50_000,
+        }
+    }
+}
+
 /// Correlates live Starknet transaction and receipt websocket notifications.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct StarknetLiveAssembler {
     entries: HashMap<models::FieldElement, LiveEntry>,
     event_entries: HashMap<LiveEventKey, LiveEventEntry>,
     pending_updates: VecDeque<LivePendingUpdate>,
     next_arrival_order: u64,
+    limits: LiveAssemblerLimits,
+}
+
+impl Default for StarknetLiveAssembler {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::default(),
+            event_entries: HashMap::default(),
+            pending_updates: VecDeque::default(),
+            next_arrival_order: 0,
+            limits: LiveAssemblerLimits::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +117,13 @@ struct LiveEventEntry {
 impl StarknetLiveAssembler {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_limits(limits: LiveAssemblerLimits) -> Self {
+        Self {
+            limits,
+            ..Default::default()
+        }
     }
 
     pub fn push_message(&mut self, message: StarknetLiveMessage) -> LiveAssemblerInsert {
@@ -134,6 +174,7 @@ impl StarknetLiveAssembler {
             block_number,
             mode: LivePendingUpdateMode::Events,
         });
+        self.prune_local_state();
 
         LiveAssemblerInsert::Inserted
     }
@@ -162,7 +203,12 @@ impl StarknetLiveAssembler {
             changed = true;
         }
 
-        insertion_result(was_new, changed)
+        let result = insertion_result(was_new, changed);
+        if result != LiveAssemblerInsert::Duplicate {
+            self.prune_local_state();
+        }
+
+        result
     }
 
     pub fn push_receipt(&mut self, message: NewTransactionReceiptMessage) -> LiveAssemblerInsert {
@@ -192,7 +238,12 @@ impl StarknetLiveAssembler {
             });
         }
 
-        insertion_result(was_new, changed)
+        let result = insertion_result(was_new, changed);
+        if result != LiveAssemblerInsert::Duplicate {
+            self.prune_local_state();
+        }
+
+        result
     }
 
     pub fn pending_block_numbers(&self) -> Vec<u64> {
@@ -462,6 +513,48 @@ impl StarknetLiveAssembler {
         entries.sort_by_key(|entry| entry.order_key());
 
         entries
+    }
+
+    fn prune_local_state(&mut self) {
+        let min_unmatched_arrival_order = self
+            .next_arrival_order
+            .saturating_sub(self.limits.max_unmatched_entry_age);
+
+        self.entries.retain(|_, entry| {
+            entry.receipt.is_some() || entry.arrival_order >= min_unmatched_arrival_order
+        });
+
+        while self.entries.len() > self.limits.max_entries {
+            let Some(oldest) = self.oldest_entry_key() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+
+        while self.event_entries.len() > self.limits.max_event_entries {
+            let Some(oldest) = self.oldest_event_key() else {
+                break;
+            };
+            self.event_entries.remove(&oldest);
+        }
+
+        while self.pending_updates.len() > self.limits.max_pending_updates {
+            self.pending_updates.pop_front();
+        }
+    }
+
+    fn oldest_entry_key(&self) -> Option<models::FieldElement> {
+        self.entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.arrival_order)
+            .map(|(key, _)| *key)
+    }
+
+    fn oldest_event_key(&self) -> Option<LiveEventKey> {
+        self.event_entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.arrival_order)
+            .map(|(key, _)| *key)
     }
 }
 
@@ -775,6 +868,57 @@ mod tests {
         assembler.prune_through_block(10);
 
         assert!(!assembler.entries.contains_key(&felt(1)));
+    }
+
+    #[test]
+    fn prunes_stale_transaction_only_entries_without_block_number() {
+        let mut assembler = StarknetLiveAssembler::with_limits(LiveAssemblerLimits {
+            max_unmatched_entry_age: 2,
+            ..LiveAssemblerLimits::default()
+        });
+
+        assembler.push_transaction_with_meta(transaction(1), None, None);
+        assembler.push_transaction_with_meta(transaction(2), None, None);
+        assembler.push_transaction_with_meta(transaction(3), None, None);
+
+        assert!(!assembler.entries.contains_key(&felt(1)));
+        assert!(assembler.entries.contains_key(&felt(2)));
+        assert!(assembler.entries.contains_key(&felt(3)));
+    }
+
+    #[test]
+    fn retains_receipt_entries_past_unmatched_entry_age() {
+        let mut assembler = StarknetLiveAssembler::with_limits(LiveAssemblerLimits {
+            max_unmatched_entry_age: 2,
+            ..LiveAssemblerLimits::default()
+        });
+
+        assembler.push_receipt_with_meta(receipt(1, 10), Some(0));
+        assembler.push_transaction_with_meta(transaction(2), None, None);
+        assembler.push_transaction_with_meta(transaction(3), None, None);
+        assembler.push_transaction_with_meta(transaction(4), None, None);
+
+        assert!(assembler.entries.contains_key(&felt(1)));
+        assert!(!assembler.entries.contains_key(&felt(2)));
+    }
+
+    #[test]
+    fn caps_live_assembler_queues() {
+        let mut assembler = StarknetLiveAssembler::with_limits(LiveAssemblerLimits {
+            max_entries: 2,
+            max_event_entries: 2,
+            max_pending_updates: 2,
+            max_unmatched_entry_age: 100,
+        });
+
+        for hash in 1..=4 {
+            assembler.push_receipt_with_meta(receipt(hash, 10), Some(hash));
+            assembler.push_event_with_meta(emitted_event(hash, 10, hash, 0));
+        }
+
+        assert_eq!(assembler.entries.len(), 2);
+        assert_eq!(assembler.event_entries.len(), 2);
+        assert_eq!(assembler.pending_updates.len(), 2);
     }
 
     #[test]

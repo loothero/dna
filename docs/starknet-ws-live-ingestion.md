@@ -2,6 +2,10 @@
 
 This change adds an opt-in push-first live ingestion plane for Starknet pre-confirmed events, transaction receipts, and transaction data.
 
+## Scope
+
+This is not full Starknet `PRE_CONFIRMED` state support. The live plane is an optimistic fast path for event, receipt, and transaction fragments. Canonical HTTP ingestion remains responsible for state updates, storage diffs, nonces, contract/class changes, optional traces, accepted blocks, finalized blocks, and reorg reconciliation.
+
 ## Problem
 
 The existing Starknet pending path polls `getBlockWithReceipts(PRE_CONFIRMED)` and then waits for `getStateUpdate(PRE_CONFIRMED)` before a pending DNA block can be written. Event and receipt-only consumers therefore inherit state update latency even though Starknet websocket subscriptions can deliver the relevant receipt/event payload earlier.
@@ -24,7 +28,7 @@ The new websocket live plane handles optimistic pending data:
 - `starknet_subscribeNewTransactions` with `PRE_CONFIRMED`.
 - Optionally, `starknet_subscribeEvents` with `PRE_CONFIRMED` and a server-level event filter.
 
-Receipt and transaction notifications are correlated by `transaction_hash` in `StarknetLiveAssembler`. As soon as receipt/event data is available for the next pending block, DNA can write a pending block fragment without waiting for `getStateUpdate(PRE_CONFIRMED)`. If the transaction body has not arrived yet, receipt/event-only fragments are still emitted.
+Receipt and transaction notifications are correlated by `transaction_hash` in `StarknetLiveAssembler`. As soon as receipt/event data is available for a pending block, DNA can write a pending block fragment without waiting for `getStateUpdate(PRE_CONFIRMED)`. If the transaction body has not arrived yet, receipt/event-only fragments are still emitted.
 
 Accepted/finalized HTTP ingestion later writes canonical blocks and prunes live assembler entries through the accepted block number.
 
@@ -54,7 +58,13 @@ STARKNET_WS_LIVE_EVENT_ADDRESS=0x...
 STARKNET_WS_LIVE_EVENT_KEY0=0x...
 ```
 
-These filters are not derived from individual DNA stream requests. They should be configured for the live event surface that the server is expected to optimize.
+These filters are not derived from individual DNA stream requests. They should be configured for the live event surface that the server is expected to optimize. Streams outside this server-level event filter can still benefit from pushed receipt data, but they will not receive the event-subscription fast path unless the server-level filter includes their events.
+
+The in-memory live assembler is bounded. Unmatched transaction-only records are evicted after a fixed arrival window, and record/update queues have fixed caps, so dropped websocket counterparts or reconnect gaps cannot grow memory without bound.
+
+## Dependency Note
+
+The branch uses Rustls-backed TLS for the new WebSocket and benchmark clients, and aligns the existing `reqwest`/Azure object-store TLS features with that choice. This avoids adding an OpenSSL/pkg-config requirement to the Starknet DNA build and Docker image while keeping HTTPS/WSS certificate verification through platform/root stores.
 
 ## Benchmark
 

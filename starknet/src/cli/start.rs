@@ -35,7 +35,7 @@ pub struct StartCommand {
     )]
     ingest_pre_confirmed: bool,
 
-    /// Ingest pre-confirmed transaction and receipt data from Starknet WebSocket subscriptions.
+    /// Enable the optimistic WebSocket fast path for pre-confirmed events, receipts, and transactions.
     #[arg(
         long = "starknet.ws-live-ingestion-enabled",
         env = "STARKNET_WS_LIVE_INGESTION_ENABLED",

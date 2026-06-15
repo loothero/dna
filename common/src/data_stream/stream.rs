@@ -15,6 +15,7 @@ use tracing::{debug, error, Instrument};
 
 use crate::{
     block_store::BlockStoreReader,
+    chain::PendingBlockRef,
     chain_view::{ChainView, NextCursor},
     data_stream::{fragment_access::BlockAccess, FilterMatch, FragmentAccess, SegmentStream},
     file_cache::FileCacheError,
@@ -427,7 +428,7 @@ impl DataStream {
     async fn send_pending_block(
         &self,
         head: &Cursor,
-        pending_block: crate::chain::PendingBlockRef,
+        pending_block: PendingBlockRef,
         content_hash: &mut Vec<u8>,
         tx: &mpsc::Sender<DataStreamMessage>,
         ct: &CancellationToken,
@@ -436,12 +437,7 @@ impl DataStream {
 
         debug!("tick: pending block");
 
-        let block_cursor = Cursor::new_pending(pending_block.number_after(head));
-        let end_cursor = if pending_block.is_next_after(head) {
-            block_cursor.clone()
-        } else {
-            head.clone()
-        };
+        let (block_cursor, end_cursor) = pending_block_cursors(head, pending_block);
 
         debug!(cursor = %head, end_cursor = %end_cursor, block_cursor = %block_cursor, "sending pending data");
 
@@ -685,6 +681,17 @@ impl DataStream {
     }
 }
 
+fn pending_block_cursors(head: &Cursor, pending_block: PendingBlockRef) -> (Cursor, Cursor) {
+    let block_cursor = Cursor::new_pending(pending_block.number_after(head));
+    let end_cursor = if pending_block.is_next_after(head) {
+        block_cursor.clone()
+    } else {
+        head.clone()
+    };
+
+    (block_cursor, end_cursor)
+}
+
 fn add_join_target_matches(
     fragment_matches: &mut BTreeMap<FragmentId, FilterMatch>,
     target_fragment_id: FragmentId,
@@ -735,6 +742,37 @@ impl Drop for DataStream {
 mod tests {
     use super::*;
     use crate::join::{JoinTo, JoinToOneIndexBuilder};
+    use crate::new_test_cursor;
+
+    #[test]
+    fn pending_block_cursors_advance_for_legacy_pending_ref() {
+        let head = new_test_cursor(10, 0);
+
+        let (block_cursor, end_cursor) = pending_block_cursors(&head, PendingBlockRef::legacy(1));
+
+        assert_eq!(block_cursor.number, 11);
+        assert_eq!(end_cursor, block_cursor);
+    }
+
+    #[test]
+    fn pending_block_cursors_advance_for_next_pending_ref() {
+        let head = new_test_cursor(10, 0);
+
+        let (block_cursor, end_cursor) = pending_block_cursors(&head, PendingBlockRef::new(11, 1));
+
+        assert_eq!(block_cursor.number, 11);
+        assert_eq!(end_cursor, block_cursor);
+    }
+
+    #[test]
+    fn pending_block_cursors_do_not_advance_end_cursor_for_future_pending_ref() {
+        let head = new_test_cursor(10, 0);
+
+        let (block_cursor, end_cursor) = pending_block_cursors(&head, PendingBlockRef::new(12, 1));
+
+        assert_eq!(block_cursor.number, 12);
+        assert_eq!(end_cursor, head);
+    }
 
     #[test]
     fn join_expansion_skips_empty_target_matches() {
