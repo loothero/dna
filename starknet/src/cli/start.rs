@@ -61,6 +61,12 @@ pub struct StartCommand {
 impl StartCommand {
     pub async fn run(self, ct: CancellationToken) -> Result<(), StarknetError> {
         info!("Starting Starknet DNA server");
+        if self.ws_live_ingestion_enabled && self.ws_url.is_none() {
+            return Err(StarknetError).attach_printable(
+                "STARKNET_WS_URL is required when STARKNET_WS_LIVE_INGESTION_ENABLED=true",
+            );
+        }
+
         let provider = self.rpc.to_starknet_provider()?;
         let starknet_ingestion_options = StarknetBlockIngestionOptions {
             ingest_pending: self.ingest_pre_confirmed || self.ws_live_ingestion_enabled,

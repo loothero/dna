@@ -1,6 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 
-use apibara_dna_common::fragment::{Block, HeaderFragment, IndexGroupFragment, JoinGroupFragment};
+use apibara_dna_common::fragment::{
+    Block, BodyFragment, FragmentId, HeaderFragment, IndexFragment, IndexGroupFragment,
+    JoinFragment, JoinGroupFragment,
+};
 use apibara_dna_common::ingestion::IngestionError;
 use apibara_dna_protocol::starknet;
 use error_stack::Result;
@@ -221,9 +224,8 @@ impl StarknetLiveAssembler {
     pub fn prune_through_block(&mut self, block_number: u64) {
         self.entries.retain(|_, entry| {
             entry
-                .receipt
-                .as_ref()
-                .map(|receipt| receipt.block.block_number() > block_number)
+                .block_number
+                .map(|entry_block_number| entry_block_number > block_number)
                 .unwrap_or(true)
         });
         self.event_entries
@@ -374,7 +376,15 @@ impl StarknetLiveAssembler {
             .map(|entry| entry.event.clone())
             .collect::<Vec<_>>();
 
-        let body_ingestion_result = collect_events_body_and_index(&events)?;
+        let mut body_ingestion_result = collect_receipts_body_and_index(&[])?;
+        let event_ingestion_result = collect_events_body_and_index(&events)?;
+        replace_body_fragments(&mut body_ingestion_result.body, event_ingestion_result.body);
+        replace_index_fragments(
+            &mut body_ingestion_result.index,
+            event_ingestion_result.index,
+        );
+        replace_join_fragments(&mut body_ingestion_result.join, event_ingestion_result.join);
+
         self.finish_pending_block(block_number, transaction_hashes, body_ingestion_result)
     }
 
@@ -495,6 +505,60 @@ fn insertion_result(was_uncorrelated: bool, changed: bool) -> LiveAssemblerInser
         (_, false) => LiveAssemblerInsert::Duplicate,
         (true, true) => LiveAssemblerInsert::Inserted,
         (false, true) => LiveAssemblerInsert::Updated,
+    }
+}
+
+fn replace_body_fragments(target: &mut Vec<BodyFragment>, replacements: Vec<BodyFragment>) {
+    for replacement in replacements {
+        replace_fragment_by_id(target, replacement.fragment_id, replacement);
+    }
+}
+
+fn replace_index_fragments(target: &mut Vec<IndexFragment>, replacements: Vec<IndexFragment>) {
+    for replacement in replacements {
+        replace_fragment_by_id(target, replacement.fragment_id, replacement);
+    }
+}
+
+fn replace_join_fragments(target: &mut Vec<JoinFragment>, replacements: Vec<JoinFragment>) {
+    for replacement in replacements {
+        replace_fragment_by_id(target, replacement.fragment_id, replacement);
+    }
+}
+
+fn replace_fragment_by_id<T>(target: &mut Vec<T>, fragment_id: FragmentId, replacement: T)
+where
+    T: HasFragmentId,
+{
+    if let Some(position) = target
+        .iter()
+        .position(|fragment| fragment.fragment_id() == fragment_id)
+    {
+        target[position] = replacement;
+    } else {
+        target.push(replacement);
+    }
+}
+
+trait HasFragmentId {
+    fn fragment_id(&self) -> FragmentId;
+}
+
+impl HasFragmentId for BodyFragment {
+    fn fragment_id(&self) -> FragmentId {
+        self.fragment_id
+    }
+}
+
+impl HasFragmentId for IndexFragment {
+    fn fragment_id(&self) -> FragmentId {
+        self.fragment_id
+    }
+}
+
+impl HasFragmentId for JoinFragment {
+    fn fragment_id(&self) -> FragmentId {
+        self.fragment_id
     }
 }
 
@@ -661,11 +725,18 @@ mod tests {
             body_fragment(&pending.block, EVENT_FRAGMENT_ID).data.len(),
             1
         );
-        assert!(!pending
-            .block
-            .body
-            .iter()
-            .any(|fragment| fragment.fragment_id == RECEIPT_FRAGMENT_ID));
+        assert_eq!(
+            body_fragment(&pending.block, TRANSACTION_FRAGMENT_ID)
+                .data
+                .len(),
+            0
+        );
+        assert_eq!(
+            body_fragment(&pending.block, RECEIPT_FRAGMENT_ID)
+                .data
+                .len(),
+            0
+        );
     }
 
     #[test]
@@ -683,11 +754,27 @@ mod tests {
             body_fragment(&pending.block, EVENT_FRAGMENT_ID).data.len(),
             1
         );
-        assert!(!pending
-            .block
-            .body
-            .iter()
-            .any(|fragment| fragment.fragment_id == RECEIPT_FRAGMENT_ID));
+        assert_eq!(
+            body_fragment(&pending.block, RECEIPT_FRAGMENT_ID)
+                .data
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn prunes_transaction_only_entries_by_block_number() {
+        let mut assembler = StarknetLiveAssembler::new();
+
+        assert_eq!(
+            assembler.push_transaction_with_meta(transaction(1), Some(10), Some(0)),
+            LiveAssemblerInsert::Inserted
+        );
+        assert_eq!(assembler.pending_block_numbers(), Vec::<u64>::new());
+
+        assembler.prune_through_block(10);
+
+        assert!(!assembler.entries.contains_key(&felt(1)));
     }
 
     #[test]

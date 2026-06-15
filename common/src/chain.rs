@@ -80,6 +80,12 @@ impl PendingBlockRef {
     pub fn number_after(self, head: &Cursor) -> u64 {
         self.number.unwrap_or(head.number + 1)
     }
+
+    pub fn is_next_after(self, head: &Cursor) -> bool {
+        self.number
+            .map(|number| number == head.number + 1)
+            .unwrap_or(true)
+    }
 }
 
 /// What action to take on reconnection.
@@ -579,7 +585,7 @@ impl ReconnectAction {
 mod tests {
     use crate::{new_test_cursor, Hash};
 
-    use super::{BlockInfo, CanonicalChainBuilder, ReconnectAction};
+    use super::{BlockInfo, CanonicalChainBuilder, PendingBlockRef, ReconnectAction};
 
     fn genesis_block(chain: u8) -> BlockInfo {
         let c = new_test_cursor(1_000, chain);
@@ -597,6 +603,16 @@ mod tests {
             hash: c.hash,
             parent: block.hash.clone(),
         }
+    }
+
+    #[test]
+    fn pending_block_ref_is_next_after_head() {
+        let head = new_test_cursor(10, 0);
+
+        assert!(PendingBlockRef::new(11, 1).is_next_after(&head));
+        assert!(PendingBlockRef::legacy(1).is_next_after(&head));
+        assert!(!PendingBlockRef::new(10, 1).is_next_after(&head));
+        assert!(!PendingBlockRef::new(12, 1).is_next_after(&head));
     }
 
     /*

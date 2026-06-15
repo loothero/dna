@@ -158,18 +158,31 @@ impl BlockIngestion for StarknetBlockIngestion {
             return Ok(futures::stream::pending().boxed());
         };
 
-        let event_filter = self.live_event_filter()?;
+        let event_filter = match self.live_event_filter() {
+            Ok(event_filter) => event_filter,
+            Err(err) => {
+                use futures::StreamExt;
+                return Ok(futures::stream::once(async move { Err(err) }).boxed());
+            }
+        };
         info!(
             event_filter_enabled = event_filter.is_some(),
             "subscribing to live starknet transaction receipts"
         );
 
         let assembler = self.live_assembler.clone();
-        let stream = StarknetLiveTransactionsStream::connect(url, event_filter)
-            .await
-            .change_context(IngestionError::RpcRequest)
-            .attach_printable("failed to connect to starknet live ws")?
-            .timeout(Duration::from_secs(60));
+        let stream = match StarknetLiveTransactionsStream::connect(url, event_filter).await {
+            Ok(stream) => stream.timeout(Duration::from_secs(60)),
+            Err(err) => {
+                use futures::StreamExt;
+                return Ok(futures::stream::once(async move {
+                    Err(err)
+                        .change_context(IngestionError::RpcRequest)
+                        .attach_printable("failed to connect to starknet live ws")
+                })
+                .boxed());
+            }
+        };
 
         {
             use futures::StreamExt;
@@ -294,7 +307,7 @@ impl BlockIngestion for StarknetBlockIngestion {
                 return Ok(Some((block_info, live_block.block)));
             }
 
-            return Ok(None);
+            // Preserve the existing HTTP pending path when live WS data is not available.
         }
 
         let block_id = BlockId::Pending;

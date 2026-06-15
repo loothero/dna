@@ -436,9 +436,14 @@ impl DataStream {
 
         debug!("tick: pending block");
 
-        let end_cursor = Cursor::new_pending(pending_block.number_after(head));
+        let block_cursor = Cursor::new_pending(pending_block.number_after(head));
+        let end_cursor = if pending_block.is_next_after(head) {
+            block_cursor.clone()
+        } else {
+            head.clone()
+        };
 
-        debug!(cursor = %head, end_cursor = %end_cursor, "sending pending data");
+        debug!(cursor = %head, end_cursor = %end_cursor, block_cursor = %block_cursor, "sending pending data");
 
         let proto_cursor: Option<ProtoCursor> = Some(head.clone().into());
         let proto_end_cursor: Option<ProtoCursor> = Some(end_cursor.clone().into());
@@ -446,12 +451,12 @@ impl DataStream {
 
         let block_entry: BlockAccess = self
             .store
-            .get_pending_block(&end_cursor, pending_block.generation)
+            .get_pending_block(&block_cursor, pending_block.generation)
             .await
             .map_err(FileCacheError::Foyer)
             .change_context(DataStreamError)
             .attach_printable("failed to get pending block")
-            .attach_printable_lazy(|| format!("cursor: {}", end_cursor))
+            .attach_printable_lazy(|| format!("cursor: {}", block_cursor))
             .attach_printable_lazy(|| format!("generation: {}", pending_block.generation))?
             .into();
 
